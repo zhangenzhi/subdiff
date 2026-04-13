@@ -1,0 +1,62 @@
+# SubDiff Pretraining Config - ViT-B/16 on ImageNet
+
+# Data
+data:
+  imagenet_dir: /path/to/imagenet  # should contain train/ and val/
+  image_size: 224
+  num_workers: 8
+
+# Model
+model:
+  patch_size: 16
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  decoder_embed_dim: 512
+  decoder_depth: 4
+  decoder_num_heads: 8
+
+# Diffusion
+diffusion:
+  num_timesteps: 1000
+  beta_start: 0.0001
+  beta_end: 0.02
+  schedule_type: linear  # linear or cosine
+
+# Curriculum learning
+curriculum:
+  # Noise strength: sample t from [t_min, t_max], both decay over training
+  t_min_start: 800       # early training: strong noise
+  t_min_end: 100         # late training: allow weak noise
+  t_max_start: 1000
+  t_max_end: 600
+  # Clean patch ratio: decays over training
+  clean_ratio_start: 0.25
+  clean_ratio_end: 0.05
+  # Warmup epochs before curriculum starts decaying
+  warmup_epochs: 10
+  schedule: cosine       # linear or cosine decay
+
+# Training
+training:
+  epochs: 300
+  batch_size: 256        # per GPU
+  lr: 1.5e-4
+  min_lr: 1.0e-6
+  weight_decay: 0.05
+  warmup_epochs: 40
+  optimizer: adamw
+  clip_grad: 3.0
+
+# Linear probe (periodic evaluation)
+probe:
+  eval_every: 20         # evaluate every N epochs
+  probe_lr: 0.1
+  probe_epochs: 30
+  num_classes: 1000
+
+# Logging
+logging:
+  log_dir: ./logs
+  save_every: 20         # save checkpoint every N epochs
+  print_every: 100       # print loss every N steps
