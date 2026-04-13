@@ -1,0 +1,36 @@
+# SubDiff Classification Finetuning Config - ViT-B/16 on ImageNet
+
+# Data
+data:
+  imagenet_dir: /path/to/imagenet
+  image_size: 224
+  num_workers: 8
+
+# Model (must match pretrained encoder)
+model:
+  patch_size: 16
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  decoder_embed_dim: 512
+  decoder_depth: 4
+  decoder_num_heads: 8
+
+# Training
+training:
+  epochs: 100
+  batch_size: 256
+  lr: 1.0e-3
+  min_lr: 1.0e-6
+  weight_decay: 0.05
+  warmup_epochs: 5
+  layer_decay: 0.65       # layer-wise lr decay for encoder
+  clip_grad: 5.0
+  num_classes: 1000
+  label_smoothing: 0.1
+
+# Logging
+logging:
+  log_dir: ./logs/finetune_cls
+  save_every: 10
+  print_every: 100

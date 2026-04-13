@@ -21,16 +21,20 @@ This unifies the benefits of MAE (global structure) and diffusion (noise-robust 
 ```
 subdiff/
 ├── configs/
-│   └── pretrain_vit_b16.yaml    # Training config
+│   ├── pretrain_vit_b16.yaml       # Pretraining config
+│   ├── finetune_cls.yaml           # Classification finetuning config
+│   └── finetune_diffusion.yaml     # Diffusion finetuning config
 ├── subdiff/
-│   ├── vit.py                   # ViT encoder + decoder
-│   ├── diffusion.py             # Patch-level diffusion noise
-│   ├── curriculum.py            # Curriculum learning scheduler
-│   ├── model.py                 # SubDiff main model
-│   └── data.py                  # ImageNet data loading
+│   ├── vit.py                      # ViT encoder + decoder
+│   ├── diffusion.py                # Patch-level diffusion noise
+│   ├── curriculum.py               # Curriculum learning scheduler
+│   ├── model.py                    # SubDiff main model
+│   └── data.py                     # ImageNet data loading
 ├── scripts/
-│   ├── pretrain.py              # Pretraining script (DDP)
-│   └── linear_probe.py          # Linear probe evaluation
+│   ├── pretrain.py                 # Pretraining script (DDP)
+│   ├── linear_probe.py             # Linear probe evaluation
+│   ├── finetune_cls.py             # Classification finetuning
+│   └── finetune_diffusion.py       # Diffusion finetuning (small patches)
 └── requirements.txt
 ```
 
@@ -62,6 +66,36 @@ python scripts/pretrain.py --config configs/pretrain_vit_b16.yaml --resume logs/
 ```bash
 python scripts/linear_probe.py \
     --config configs/pretrain_vit_b16.yaml \
+    --checkpoint logs/checkpoints/checkpoint_final.pth
+```
+
+### Classification Finetuning
+
+Full finetuning with layer-wise lr decay on ImageNet-1K.
+
+```bash
+python scripts/finetune_cls.py \
+    --config configs/finetune_cls.yaml \
+    --checkpoint logs/checkpoints/checkpoint_final.pth
+
+# Multi-GPU
+torchrun --nproc_per_node=8 scripts/finetune_cls.py \
+    --config configs/finetune_cls.yaml \
+    --checkpoint logs/checkpoints/checkpoint_final.pth
+```
+
+### Diffusion Finetuning
+
+Train a diffusion decoder (smaller 8x8 patches) conditioned on the frozen pretrained encoder.
+
+```bash
+python scripts/finetune_diffusion.py \
+    --config configs/finetune_diffusion.yaml \
+    --checkpoint logs/checkpoints/checkpoint_final.pth
+
+# Multi-GPU
+torchrun --nproc_per_node=8 scripts/finetune_diffusion.py \
+    --config configs/finetune_diffusion.yaml \
     --checkpoint logs/checkpoints/checkpoint_final.pth
 ```
 

@@ -1,0 +1,49 @@
+# SubDiff Diffusion Finetuning Config
+# Uses pretrained encoder (frozen) + new diffusion decoder with smaller patches
+
+# Data
+data:
+  imagenet_dir: /path/to/imagenet
+  image_size: 224
+  num_workers: 8
+
+# Model
+model:
+  # Encoder (must match pretrained)
+  encoder_patch_size: 16
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  pretrain_decoder_dim: 512
+  pretrain_decoder_depth: 4
+  pretrain_decoder_num_heads: 8
+
+  # Diffusion decoder (new, smaller patch size)
+  decoder_patch_size: 8     # smaller patches for fine-grained generation
+  decoder_dim: 512
+  decoder_depth: 6
+  decoder_num_heads: 8
+
+# Diffusion
+diffusion:
+  num_timesteps: 1000
+  beta_start: 0.0001
+  beta_end: 0.02
+  schedule_type: linear
+
+# Training
+training:
+  epochs: 200
+  batch_size: 128           # smaller batch due to more patches (784 vs 196)
+  lr: 1.0e-4
+  min_lr: 1.0e-6
+  weight_decay: 0.01
+  warmup_epochs: 10
+  clip_grad: 1.0
+  freeze_encoder: true      # freeze pretrained encoder
+
+# Logging
+logging:
+  log_dir: ./logs/finetune_diffusion
+  save_every: 20
+  print_every: 100
