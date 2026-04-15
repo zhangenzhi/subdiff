@@ -38,7 +38,7 @@ from subdiff.data import build_pretrain_dataloader
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True)
-    parser.add_argument('--checkpoint', type=str, required=True, help='pretrained checkpoint')
+    parser.add_argument('--checkpoint', type=str, default=None, help='pretrained checkpoint (omit for scratch baseline)')
     return parser.parse_args()
 
 
@@ -60,7 +60,7 @@ def setup_distributed():
 
 def cosine_lr_schedule(optimizer, epoch, total_epochs, warmup_epochs, lr, min_lr):
     if epoch < warmup_epochs:
-        cur_lr = lr * epoch / max(warmup_epochs, 1)
+        cur_lr = lr * (epoch + 1) / max(warmup_epochs, 1)
     else:
         progress = (epoch - warmup_epochs) / max(total_epochs - warmup_epochs, 1)
         cur_lr = min_lr + (lr - min_lr) * 0.5 * (1.0 + math.cos(math.pi * progress))
@@ -335,6 +335,94 @@ class DiffusionFinetune(nn.Module):
         return self.unpatchify(x, self.decoder_patch_size)
 
 
+def _transfer_decoder_weights(pretrained_decoder, diff_decoder, verbose=False):
+    """Transfer compatible weights from pretrained decoder to diffusion decoder.
+
+    Mapping (pretrained Block → DiffusionDecoderBlock):
+      attn.qkv.weight/bias     → self_attn.in_proj_weight/bias
+      attn.proj.weight/bias     → self_attn.out_proj.weight/bias
+      norm1                     → norm1
+      norm2 (pre-MLP)           → norm3 (pre-MLP in diffusion block)
+      mlp.fc1.weight/bias       → mlp.0.weight/bias
+      mlp.fc2.weight/bias       → mlp.2.weight/bias
+
+    Also transfers:
+      proj (encoder_dim→decoder_dim) → input_proj (if shapes match)
+      pos_embed                      → pos_embed (if shapes match)
+      norm                           → norm
+    """
+    n_transferred = 0
+
+    # Top-level: proj, pos_embed, norm
+    mapping_top = {
+        'proj.weight': 'input_proj.weight',
+        'proj.bias': 'input_proj.bias',
+        'norm.weight': 'norm.weight',
+        'norm.bias': 'norm.bias',
+    }
+    pre_sd = dict(pretrained_decoder.named_parameters())
+    diff_sd = dict(diff_decoder.named_parameters())
+
+    # pos_embed (buffer, not parameter)
+    pre_pos = pretrained_decoder.pos_embed
+    diff_pos = diff_decoder.pos_embed
+    if pre_pos.shape == diff_pos.shape:
+        diff_pos.data.copy_(pre_pos.data)
+        n_transferred += 1
+        if verbose:
+            print(f"  pos_embed: {list(pre_pos.shape)}")
+
+    for pre_name, diff_name in mapping_top.items():
+        if pre_name in pre_sd and diff_name in diff_sd:
+            pre_p = pre_sd[pre_name]
+            diff_p = diff_sd[diff_name]
+            if pre_p.shape == diff_p.shape:
+                diff_p.data.copy_(pre_p.data)
+                n_transferred += 1
+                if verbose:
+                    print(f"  {pre_name} → {diff_name}: {list(pre_p.shape)}")
+
+    # Per-block transfer
+    n_blocks = min(len(pretrained_decoder.blocks), len(diff_decoder.blocks))
+    for i in range(n_blocks):
+        pre_block = pretrained_decoder.blocks[i]
+        diff_block = diff_decoder.blocks[i]
+
+        block_mapping = {
+            # Self-attention
+            'attn.qkv.weight': 'self_attn.in_proj_weight',
+            'attn.qkv.bias': 'self_attn.in_proj_bias',
+            'attn.proj.weight': 'self_attn.out_proj.weight',
+            'attn.proj.bias': 'self_attn.out_proj.bias',
+            # Norms
+            'norm1.weight': 'norm1.weight',
+            'norm1.bias': 'norm1.bias',
+            'norm2.weight': 'norm3.weight',  # pre-MLP norm
+            'norm2.bias': 'norm3.bias',
+            # MLP
+            'mlp.fc1.weight': 'mlp.0.weight',
+            'mlp.fc1.bias': 'mlp.0.bias',
+            'mlp.fc2.weight': 'mlp.2.weight',
+            'mlp.fc2.bias': 'mlp.2.bias',
+        }
+
+        pre_block_sd = dict(pre_block.named_parameters())
+        diff_block_sd = dict(diff_block.named_parameters())
+
+        for pre_name, diff_name in block_mapping.items():
+            if pre_name in pre_block_sd and diff_name in diff_block_sd:
+                pre_p = pre_block_sd[pre_name]
+                diff_p = diff_block_sd[diff_name]
+                if pre_p.shape == diff_p.shape:
+                    diff_p.data.copy_(pre_p.data)
+                    n_transferred += 1
+
+        if verbose:
+            print(f"  block {i}: transferred attention + MLP + norms")
+
+    return n_transferred
+
+
 def main():
     args = get_args()
     cfg = load_config(args.config)
@@ -347,7 +435,7 @@ def main():
     model_cfg = cfg['model']
     diff_cfg = cfg['diffusion']
 
-    # Load pretrained encoder
+    # Load encoder
     pretrained = SubDiff(
         img_size=cfg['data']['image_size'],
         patch_size=model_cfg['encoder_patch_size'],
@@ -359,12 +447,16 @@ def main():
         decoder_num_heads=model_cfg.get('pretrain_decoder_num_heads', 8),
         total_epochs=1,
     )
-    ckpt = torch.load(args.checkpoint, map_location='cpu')
-    pretrained.load_state_dict(ckpt['model'])
-    encoder = pretrained.get_encoder()
+    if args.checkpoint:
+        ckpt = torch.load(args.checkpoint, map_location='cpu')
+        pretrained.load_state_dict(ckpt['model'])
+        if is_main:
+            print(f"Loaded pretrained encoder from epoch {ckpt['epoch']}")
+    else:
+        if is_main:
+            print("No checkpoint provided — training from scratch (baseline)")
 
-    if is_main:
-        print(f"Loaded pretrained encoder from epoch {ckpt['epoch']}")
+    encoder = pretrained.get_encoder()
 
     # Build diffusion finetune model
     model = DiffusionFinetune(
@@ -383,6 +475,14 @@ def main():
         freeze_encoder=train_cfg.get('freeze_encoder', True),
     ).to(device)
 
+    # Transfer pretrained decoder weights to diffusion decoder
+    if args.checkpoint and train_cfg.get('init_decoder_from_pretrained', False):
+        pretrained_decoder = pretrained.decoder
+        diff_decoder = model.decoder
+        n_transfer = _transfer_decoder_weights(pretrained_decoder, diff_decoder, is_main)
+        if is_main:
+            print(f"Transferred {n_transfer} tensors from pretrained decoder to diffusion decoder")
+
     if is_main:
         total_params = sum(p.numel() for p in model.parameters()) / 1e6
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
@@ -391,7 +491,7 @@ def main():
               f"Decoder patch: {model_cfg['decoder_patch_size']}x{model_cfg['decoder_patch_size']}")
 
     if distributed:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+        model = DDP(model, device_ids=[local_rank])
 
     model_without_ddp = model.module if distributed else model
 

@@ -33,7 +33,7 @@ from subdiff.data import build_pretrain_dataloader, build_eval_dataloader
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True)
-    parser.add_argument('--checkpoint', type=str, required=True, help='pretrained checkpoint')
+    parser.add_argument('--checkpoint', type=str, default=None, help='pretrained checkpoint (omit for scratch baseline)')
     return parser.parse_args()
 
 
@@ -55,7 +55,7 @@ def setup_distributed():
 
 def cosine_lr_schedule(optimizer, epoch, total_epochs, warmup_epochs, lr, min_lr):
     if epoch < warmup_epochs:
-        cur_lr = lr * epoch / max(warmup_epochs, 1)
+        cur_lr = lr * (epoch + 1) / max(warmup_epochs, 1)
     else:
         progress = (epoch - warmup_epochs) / max(total_epochs - warmup_epochs, 1)
         cur_lr = min_lr + (lr - min_lr) * 0.5 * (1.0 + math.cos(math.pi * progress))
@@ -80,14 +80,15 @@ class ClassificationModel(nn.Module):
 
 
 @torch.no_grad()
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, use_amp=False, amp_dtype=torch.float32):
     model.eval()
     correct = 0
     correct_top5 = 0
     total = 0
     for imgs, labels in loader:
         imgs, labels = imgs.to(device), labels.to(device)
-        logits = model(imgs)
+        with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
+            logits = model(imgs)
         # Top-1
         preds = logits.argmax(dim=-1)
         correct += (preds == labels).sum().item()
@@ -179,7 +180,7 @@ def main():
     train_cfg = cfg['training']
     model_cfg = cfg['model']
 
-    # Load pretrained encoder
+    # Load encoder
     pretrained = SubDiff(
         img_size=cfg['data']['image_size'],
         patch_size=model_cfg['patch_size'],
@@ -191,10 +192,14 @@ def main():
         decoder_num_heads=model_cfg.get('decoder_num_heads', 8),
         total_epochs=1,  # dummy
     )
-    ckpt = torch.load(args.checkpoint, map_location='cpu')
-    pretrained.load_state_dict(ckpt['model'])
-    if is_main:
-        print(f"Loaded pretrained checkpoint from epoch {ckpt['epoch']}")
+    if args.checkpoint:
+        ckpt = torch.load(args.checkpoint, map_location='cpu')
+        pretrained.load_state_dict(ckpt['model'])
+        if is_main:
+            print(f"Loaded pretrained checkpoint from epoch {ckpt['epoch']}")
+    else:
+        if is_main:
+            print("No checkpoint provided — training from scratch (baseline)")
 
     encoder = pretrained.get_encoder()
     model = ClassificationModel(
@@ -249,6 +254,12 @@ def main():
         os.makedirs(log_dir, exist_ok=True)
         writer = SummaryWriter(log_dir)
 
+    # Mixed precision
+    use_amp = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
+    amp_dtype = torch.bfloat16 if use_amp else torch.float32
+    if is_main:
+        print(f"Mixed precision: {amp_dtype}")
+
     total_epochs = train_cfg['epochs']
     best_acc = 0.0
 
@@ -265,12 +276,16 @@ def main():
         total_loss = 0.0
         num_steps = 0
 
+        train_correct = 0
+        train_total = 0
+
         for step, (imgs, labels) in enumerate(train_loader):
             imgs = imgs.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
-            logits = model(imgs)
-            loss = criterion(logits, labels)
+            with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
+                logits = model(imgs)
+                loss = criterion(logits, labels)
 
             optimizer.zero_grad()
             loss.backward()
@@ -280,20 +295,26 @@ def main():
 
             total_loss += loss.item()
             num_steps += 1
+            preds = logits.detach().argmax(dim=-1)
+            train_correct += (preds == labels).sum().item()
+            train_total += labels.shape[0]
 
             if is_main and step % cfg['logging']['print_every'] == 0:
+                train_acc = train_correct / max(train_total, 1)
                 print(f"Epoch [{epoch}/{total_epochs}] Step [{step}/{len(train_loader)}] "
-                      f"loss={loss.item():.4f} lr={cur_lr:.6f}")
+                      f"loss={loss.item():.4f} train_acc={train_acc:.4f} lr={cur_lr:.6f}")
 
         avg_loss = total_loss / max(num_steps, 1)
 
         # Evaluate
-        top1, top5 = evaluate(model, val_loader, device)
+        top1, top5 = evaluate(model, val_loader, device, use_amp=use_amp, amp_dtype=amp_dtype)
         best_acc = max(best_acc, top1)
 
+        epoch_train_acc = train_correct / max(train_total, 1)
         if is_main:
             print(f"Epoch [{epoch}/{total_epochs}] avg_loss={avg_loss:.4f} "
-                  f"top1={top1:.4f} top5={top5:.4f} best={best_acc:.4f}")
+                  f"train_acc={epoch_train_acc:.4f} "
+                  f"val_top1={top1:.4f} val_top5={top5:.4f} best={best_acc:.4f}")
             if writer:
                 writer.add_scalar('finetune/loss', avg_loss, epoch)
                 writer.add_scalar('finetune/top1', top1, epoch)

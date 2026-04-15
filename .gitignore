@@ -7,9 +7,11 @@ build/
 
 # Logs and checkpoints
 logs/
+logs_*/
 *.pth
 *.pt
 tensorboard/
+core-python.*
 
 # IDE
 .vscode/

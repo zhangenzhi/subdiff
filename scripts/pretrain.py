@@ -24,7 +24,8 @@ from torch.utils.tensorboard import SummaryWriter
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from subdiff.model import SubDiff
-from subdiff.data import build_pretrain_dataloader
+from subdiff.data import build_pretrain_dataloader, build_eval_dataloader
+from scripts.visualize import visualize_epoch
 
 
 def get_args():
@@ -41,7 +42,7 @@ def load_config(path):
 
 def cosine_lr_schedule(optimizer, epoch, total_epochs, warmup_epochs, lr, min_lr):
     if epoch < warmup_epochs:
-        cur_lr = lr * epoch / max(warmup_epochs, 1)
+        cur_lr = lr * (epoch + 1) / max(warmup_epochs, 1)
     else:
         progress = (epoch - warmup_epochs) / max(total_epochs - warmup_epochs, 1)
         cur_lr = min_lr + (lr - min_lr) * 0.5 * (1.0 + math.cos(math.pi * progress))
@@ -96,19 +97,38 @@ def main():
         schedule_type=cfg['diffusion']['schedule_type'],
         total_epochs=cfg['training']['epochs'],
         curriculum_cfg=curriculum_cfg,
+        predict_noise=cfg.get('diffusion', {}).get('predict_noise', False),
+        mae_masking=cfg.get('model', {}).get('mae_masking', False),
+        mask_ratio=cfg.get('model', {}).get('mask_ratio', 0.25),
+        dual_decoder=cfg.get('model', {}).get('dual_decoder', False),
+        clean_ratio=cfg.get('model', {}).get('clean_ratio', 0.25),
+        pixel_loss_weight=cfg.get('model', {}).get('pixel_loss_weight', 1.0),
     ).to(device)
 
     if is_main:
         param_count = sum(p.numel() for p in model.parameters()) / 1e6
-        print(f"SubDiff model: {param_count:.1f}M parameters")
+        if model.dual_decoder:
+            mode = f"dual-decoder (clean={model.clean_ratio}, eps + {model.pixel_loss_weight}*pix)"
+        else:
+            tgt = "noise" if model.predict_noise else "pixel"
+            mode = f"MAE-masked ({model.mask_ratio}) + {tgt}" if model.mae_masking else tgt
+        print(f"SubDiff model: {param_count:.1f}M parameters, mode: {mode}")
         print(f"Curriculum: {model.curriculum}")
 
     if distributed:
-        model = DDP(model, device_ids=[local_rank])
+        # find_unused_parameters=True for MAE-masking / dual-decoder modes
+        # where some decoder params may not contribute to loss each step
+        find_unused = bool(
+            cfg.get('model', {}).get('mae_masking', False)
+            or cfg.get('model', {}).get('dual_decoder', False)
+        )
+        model = DDP(model, device_ids=[local_rank],
+                    find_unused_parameters=find_unused)
 
     model_without_ddp = model.module if distributed else model
+    model_raw = model_without_ddp
 
-    # Build dataloader
+    # Build dataloaders
     train_loader, train_sampler = build_pretrain_dataloader(
         imagenet_dir=cfg['data']['imagenet_dir'],
         image_size=cfg['data']['image_size'],
@@ -116,6 +136,16 @@ def main():
         num_workers=cfg['data']['num_workers'],
         distributed=distributed,
     )
+
+    # Val images for periodic visualization
+    vis_imgs = None
+    if is_main:
+        val_loader, _ = build_eval_dataloader(
+            imagenet_dir=cfg['data']['imagenet_dir'],
+            image_size=cfg['data']['image_size'],
+            batch_size=8, num_workers=2,
+        )
+        vis_imgs, _ = next(iter(val_loader))
 
     # Optimizer
     optimizer = torch.optim.AdamW(
@@ -131,15 +161,27 @@ def main():
         os.makedirs(cfg['logging']['log_dir'], exist_ok=True)
         writer = SummaryWriter(cfg['logging']['log_dir'])
 
+    # Mixed precision (bf16 on H100)
+    use_amp = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
+    amp_dtype = torch.bfloat16 if use_amp else torch.float32
+    scaler = torch.amp.GradScaler('cuda', enabled=(use_amp and amp_dtype == torch.float16))
+    # bf16 doesn't need GradScaler, but we keep it disabled for clean code path
+    if is_main:
+        print(f"Mixed precision: {amp_dtype}, GradScaler: {scaler.is_enabled()}")
+
     # Resume
     start_epoch = 0
+    best_loss = float('inf')
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
-        model_without_ddp.load_state_dict(ckpt['model'])
+        model_raw.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
+        if 'scaler' in ckpt and scaler.is_enabled():
+            scaler.load_state_dict(ckpt['scaler'])
         start_epoch = ckpt['epoch'] + 1
+        best_loss = ckpt.get('best_loss', float('inf'))
         if is_main:
-            print(f"Resumed from epoch {start_epoch}")
+            print(f"Resumed from epoch {start_epoch}, best_loss={best_loss:.4f}")
 
     # Training loop
     total_epochs = cfg['training']['epochs']
@@ -158,7 +200,7 @@ def main():
         )
 
         # Get curriculum state for logging
-        curriculum_state = model_without_ddp.curriculum.get_state(epoch)
+        curriculum_state = model_raw.curriculum.get_state(epoch)
 
         model.train()
         total_loss = 0.0
@@ -167,21 +209,21 @@ def main():
         for step, (imgs, _) in enumerate(train_loader):
             imgs = imgs.to(device, non_blocking=True)
 
-            loss, log_dict = model_without_ddp.forward(imgs, epoch=epoch) \
-                if not distributed else model.module.forward(imgs, epoch=epoch)
-
-            # For DDP: need to compute loss through DDP wrapper for gradient sync
-            if distributed:
-                # Re-forward through DDP for proper gradient sync
-                loss, log_dict = _forward_ddp(model, imgs, epoch)
+            with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
+                if distributed:
+                    loss, log_dict = _forward_ddp(model, imgs, epoch)
+                else:
+                    loss, log_dict = model(imgs, epoch=epoch)
 
             optimizer.zero_grad()
-            loss.backward()
+            scaler.scale(loss).backward()
 
             if cfg['training']['clip_grad'] > 0:
+                scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(model.parameters(), cfg['training']['clip_grad'])
 
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             total_loss += loss.item()
             num_steps += 1
@@ -189,50 +231,73 @@ def main():
 
             if is_main and step % print_every == 0:
                 print(f"Epoch [{epoch}/{total_epochs}] Step [{step}/{len(train_loader)}] "
-                      f"loss={loss.item():.4f} noisy_loss={log_dict['noisy_loss']:.4f} "
-                      f"clean_loss={log_dict['clean_loss']:.4f} "
+                      f"loss={log_dict['loss'].item():.4f} noisy_loss={log_dict['noisy_loss'].item():.4f} "
+                      f"clean_loss={log_dict['clean_loss'].item():.4f} "
                       f"t=[{curriculum_state['t_min']},{curriculum_state['t_max']}] "
                       f"clean_ratio={curriculum_state['clean_ratio']:.3f} lr={cur_lr:.6f}")
 
             if writer and step % print_every == 0:
-                writer.add_scalar('train/loss', loss.item(), global_step)
-                writer.add_scalar('train/noisy_loss', log_dict['noisy_loss'], global_step)
-                writer.add_scalar('train/clean_loss', log_dict['clean_loss'], global_step)
+                writer.add_scalar('train/loss', log_dict['loss'].item(), global_step)
+                writer.add_scalar('train/noisy_loss', log_dict['noisy_loss'].item(), global_step)
+                writer.add_scalar('train/clean_loss', log_dict['clean_loss'].item(), global_step)
                 writer.add_scalar('train/lr', cur_lr, global_step)
                 writer.add_scalar('curriculum/t_min', curriculum_state['t_min'], global_step)
                 writer.add_scalar('curriculum/t_max', curriculum_state['t_max'], global_step)
                 writer.add_scalar('curriculum/clean_ratio', curriculum_state['clean_ratio'], global_step)
-                writer.add_scalar('curriculum/t_mean', log_dict['t_mean'], global_step)
+                writer.add_scalar('curriculum/t_mean', log_dict['t_mean'].item(), global_step)
 
         avg_loss = total_loss / max(num_steps, 1)
         if is_main:
             print(f"Epoch [{epoch}/{total_epochs}] avg_loss={avg_loss:.4f}")
 
-        # Save checkpoint
+        # Save checkpoints: latest (every save_every) + best (when avg_loss improves)
         if is_main and (epoch + 1) % save_every == 0:
             ckpt_dir = os.path.join(cfg['logging']['log_dir'], 'checkpoints')
             os.makedirs(ckpt_dir, exist_ok=True)
-            ckpt_path = os.path.join(ckpt_dir, f'checkpoint_{epoch:04d}.pth')
-            torch.save({
-                'model': model_without_ddp.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'epoch': epoch,
-                'config': cfg,
-            }, ckpt_path)
-            print(f"Saved checkpoint: {ckpt_path}")
 
-    # Save final
+            is_best = avg_loss < best_loss
+            if is_best:
+                best_loss = avg_loss
+
+            state = {
+                'model': model_raw.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scaler': scaler.state_dict(),
+                'epoch': epoch,
+                'avg_loss': avg_loss,
+                'best_loss': best_loss,
+                'config': cfg,
+            }
+            latest_path = os.path.join(ckpt_dir, 'checkpoint_latest.pth')
+            torch.save(state, latest_path)
+            print(f"Saved latest: {latest_path} (avg_loss={avg_loss:.4f})")
+
+            if is_best:
+                best_path = os.path.join(ckpt_dir, 'checkpoint_best.pth')
+                torch.save(state, best_path)
+                print(f"Saved best: {best_path} (avg_loss={avg_loss:.4f})")
+
+            # Visualize at this epoch
+            vis_dir = os.path.join(cfg['logging']['log_dir'], 'visualizations')
+            visualize_epoch(model_raw, vis_imgs, epoch, vis_dir, device, n_samples=4)
+
+    # Save final as latest (best is kept separately)
     if is_main:
         ckpt_dir = os.path.join(cfg['logging']['log_dir'], 'checkpoints')
         os.makedirs(ckpt_dir, exist_ok=True)
-        final_path = os.path.join(ckpt_dir, 'checkpoint_final.pth')
+        latest_path = os.path.join(ckpt_dir, 'checkpoint_latest.pth')
         torch.save({
-            'model': model_without_ddp.state_dict(),
+            'model': model_raw.state_dict(),
             'optimizer': optimizer.state_dict(),
+            'scaler': scaler.state_dict(),
             'epoch': total_epochs - 1,
+            'avg_loss': avg_loss,
+            'best_loss': best_loss,
             'config': cfg,
-        }, final_path)
-        print(f"Saved final checkpoint: {final_path}")
+        }, latest_path)
+        print(f"Saved final as latest: {latest_path} (best_loss={best_loss:.4f})")
+        vis_dir = os.path.join(cfg['logging']['log_dir'], 'visualizations')
+        visualize_epoch(model_raw, vis_imgs, total_epochs - 1, vis_dir, device, n_samples=4)
 
     if distributed:
         dist.destroy_process_group()

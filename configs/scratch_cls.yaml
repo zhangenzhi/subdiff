@@ -1,0 +1,33 @@
+# Baseline: ViT-B/16 classification from scratch (no pretraining)
+
+# Data
+data:
+  imagenet_dir: /lustre1/work/c30636/dataset/imagenet
+  image_size: 224
+  num_workers: 8
+
+# Model (same architecture as pretrained)
+model:
+  patch_size: 16
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+
+# Training (longer + higher lr for scratch)
+training:
+  epochs: 300
+  batch_size: 256
+  lr: 1.0e-3
+  min_lr: 1.0e-6
+  weight_decay: 0.3
+  warmup_epochs: 20
+  layer_decay: 1.0         # no layer decay for scratch
+  clip_grad: 5.0
+  num_classes: 1000
+  label_smoothing: 0.1
+
+# Logging
+logging:
+  log_dir: ./logs/scratch_cls
+  save_every: 20
+  print_every: 100

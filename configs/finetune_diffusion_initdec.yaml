@@ -1,5 +1,5 @@
-# SubDiff Diffusion Finetuning Config
-# Uses pretrained encoder (frozen) + new diffusion decoder with smaller patches
+# Diffusion finetuning with decoder initialized from pretrained weights
+# Uses decoder_patch_size=16 (same as pretrained) so weights are directly compatible
 
 # Data
 data:
@@ -18,10 +18,10 @@ model:
   pretrain_decoder_depth: 4
   pretrain_decoder_num_heads: 8
 
-  # Diffusion decoder (new, smaller patch size)
-  decoder_patch_size: 8     # smaller patches for fine-grained generation
+  # Diffusion decoder: same patch size as pretrained for weight transfer
+  decoder_patch_size: 16    # same as pretrained (196 patches)
   decoder_dim: 512
-  decoder_depth: 6
+  decoder_depth: 4          # same as pretrained decoder
   decoder_num_heads: 8
 
 # Diffusion
@@ -34,16 +34,17 @@ diffusion:
 # Training
 training:
   epochs: 200
-  batch_size: 128           # smaller batch due to more patches (784 vs 196)
+  batch_size: 128
   lr: 1.0e-4
   min_lr: 1.0e-6
   weight_decay: 0.01
   warmup_epochs: 10
   clip_grad: 1.0
-  freeze_encoder: false     # full parameter finetuning (encoder + decoder)
+  freeze_encoder: false
+  init_decoder_from_pretrained: true   # transfer pretrained decoder weights
 
 # Logging
 logging:
-  log_dir: ./logs/finetune_diffusion
+  log_dir: ./logs/finetune_diffusion_initdec
   save_every: 20
   print_every: 100

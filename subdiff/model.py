@@ -37,7 +37,10 @@ class SubDiff(nn.Module):
                  decoder_dim=512, decoder_depth=4, decoder_num_heads=8,
                  num_timesteps=1000, beta_start=0.0001, beta_end=0.02,
                  schedule_type='linear',
-                 total_epochs=300, curriculum_cfg=None):
+                 total_epochs=300, curriculum_cfg=None,
+                 predict_noise=False,
+                 mae_masking=False, mask_ratio=0.25,
+                 dual_decoder=False, clean_ratio=0.25, pixel_loss_weight=1.0):
         super().__init__()
 
         self.patch_size = patch_size
@@ -50,12 +53,22 @@ class SubDiff(nn.Module):
             embed_dim=embed_dim, depth=depth, num_heads=num_heads
         )
 
-        # Decoder
+        # Decoder (primary: noise prediction if dual_decoder, else single-task)
         self.decoder = Decoder(
             patch_size=patch_size, num_patches=self.num_patches,
             encoder_dim=embed_dim, decoder_dim=decoder_dim,
             depth=decoder_depth, num_heads=decoder_num_heads
         )
+
+        # Optional second decoder for pixel reconstruction (dual-objective pretraining)
+        if dual_decoder:
+            self.decoder_pix = Decoder(
+                patch_size=patch_size, num_patches=self.num_patches,
+                encoder_dim=embed_dim, decoder_dim=decoder_dim,
+                depth=decoder_depth, num_heads=decoder_num_heads
+            )
+        else:
+            self.decoder_pix = None
 
         # Diffusion
         self.diffusion = PatchDiffusion(
@@ -69,6 +82,13 @@ class SubDiff(nn.Module):
         self.curriculum = CurriculumScheduler(
             total_epochs=total_epochs, **curriculum_cfg
         )
+
+        self.predict_noise = predict_noise
+        self.mae_masking = mae_masking
+        self.mask_ratio = mask_ratio
+        self.dual_decoder = dual_decoder
+        self.clean_ratio = clean_ratio
+        self.pixel_loss_weight = pixel_loss_weight
 
     def patchify(self, imgs):
         """Convert images to patch sequences.
@@ -107,6 +127,11 @@ class SubDiff(nn.Module):
             loss: reconstruction loss
             log_dict: dict with metrics for logging
         """
+        if self.dual_decoder:
+            return self._forward_dual(imgs, epoch)
+        if self.mae_masking:
+            return self._forward_mae(imgs, epoch)
+
         B = imgs.shape[0]
         device = imgs.device
 
@@ -136,28 +161,142 @@ class SubDiff(nn.Module):
         cls_token, patch_tokens = self.encoder(mixed_imgs)
 
         # Decode
-        pred_patches = self.decoder(patch_tokens)  # (B, N, patch_dim)
+        pred = self.decoder(patch_tokens)  # (B, N, patch_dim)
 
-        # Loss: MSE on noisy patches (primary), optionally also on clean patches
+        if self.predict_noise:
+            # Noise prediction: target is the noise added to patches
+            # For clean patches, noise is zero (already zeroed in apply_patch_noise)
+            target = noise
+        else:
+            # Pixel reconstruction: target is the clean patches
+            target = target_patches
+
         # Primary loss on noisy regions
-        noisy_loss = self._masked_mse(pred_patches, target_patches, noisy_mask)
+        noisy_loss = self._masked_mse(pred, target, noisy_mask)
 
-        # Secondary loss on clean regions (much smaller weight, regularization)
+        # Secondary loss on clean regions
         clean_mask = ~noisy_mask
-        clean_loss = self._masked_mse(pred_patches, target_patches, clean_mask)
+        clean_loss = self._masked_mse(pred, target, clean_mask)
 
         loss = noisy_loss + 0.1 * clean_loss
 
         log_dict = {
-            'loss': loss.item(),
-            'noisy_loss': noisy_loss.item(),
-            'clean_loss': clean_loss.item(),
+            'loss': loss.detach(),
+            'noisy_loss': noisy_loss.detach(),
+            'clean_loss': clean_loss.detach(),
             't_min': t_min,
             't_max': t_max,
             'clean_ratio': clean_ratio,
-            't_mean': t.float().mean().item(),
+            't_mean': t.float().mean().detach(),
         }
 
+        return loss, log_dict
+
+    def _forward_mae(self, imgs, epoch=0):
+        """MAE-style masked noise prediction (MaskDiT-inspired).
+
+        - Sample per-image timestep t ~ Uniform[0, T) (standard DDPM)
+        - Add noise to ALL patches via standard forward diffusion
+        - Randomly mask (mask_ratio) of patches; encoder only sees the rest
+        - Decoder fills mask tokens and predicts noise for all patches
+        - Loss: noise prediction MSE on VISIBLE patches (standard DDPM target)
+        - Auxiliary: noise prediction MSE on MASKED patches (MaskDiT regularizer)
+        """
+        B = imgs.shape[0]
+        device = imgs.device
+
+        # 1. Patchify and apply standard forward diffusion to ALL patches
+        target_patches = self.patchify(imgs)  # (B, N, patch_dim)
+        t = torch.randint(0, self.diffusion.num_timesteps, (B,), device=device)
+        noisy_patches, noise = self.diffusion.add_noise(target_patches, t)
+
+        # 2. Reconstruct noisy image (all patches noised) for encoder input
+        img_size = int(self.patch_size * (self.num_patches ** 0.5))
+        noisy_imgs = self.unpatchify(noisy_patches, img_size=img_size)
+
+        # 3. MAE-style masked encoder: only (1 - mask_ratio) visible patches
+        cls_token, visible_tokens, ids_restore, mask = self.encoder.forward_masked(
+            noisy_imgs, mask_ratio=self.mask_ratio
+        )
+        # mask: (B, N) with 1 = masked, 0 = visible
+
+        # 4. Decoder: fill mask tokens, predict noise for all patches
+        pred = self.decoder.forward_masked(visible_tokens, ids_restore)  # (B, N, patch_dim)
+
+        # 5. Loss: noise prediction. Primary on visible, aux on masked.
+        target = noise if self.predict_noise else target_patches
+        visible_mask = (mask == 0)  # True where visible
+        masked_mask = (mask == 1)   # True where masked
+
+        visible_loss = self._masked_mse(pred, target, visible_mask)
+        masked_loss = self._masked_mse(pred, target, masked_mask)
+
+        # MaskDiT weighting: primary on visible, small weight on masked
+        loss = visible_loss + 0.1 * masked_loss
+
+        log_dict = {
+            'loss': loss.detach(),
+            'noisy_loss': visible_loss.detach(),
+            'clean_loss': masked_loss.detach(),
+            't_min': 0,
+            't_max': self.diffusion.num_timesteps,
+            'clean_ratio': self.mask_ratio,
+            't_mean': t.float().mean().detach(),
+        }
+        return loss, log_dict
+
+    def _forward_dual(self, imgs, epoch=0):
+        """Dual-decoder pretraining: shared encoder + two heads.
+
+        Design:
+          - Encoder sees clean(clean_ratio) + noisy(1 - clean_ratio) patches
+            (no MAE masking — clean patches serve as spatial anchors)
+          - t ~ Uniform[0, T) per image (standard DDPM, no curriculum)
+          - decoder      → predicts noise ε for each patch (DDPM target)
+          - decoder_pix  → reconstructs clean pixel values (MAE target)
+          - Loss on the NOISY patches only (clean patches are trivial for both heads)
+          - Combined: L = L_eps + pixel_loss_weight * L_pix
+        """
+        B = imgs.shape[0]
+        device = imgs.device
+
+        target_patches = self.patchify(imgs)  # (B, N, patch_dim)
+
+        # Standard DDPM: per-image full-range t
+        t = torch.randint(0, self.diffusion.num_timesteps, (B,), device=device)
+        # clean_ratio fraction stays clean (spatial anchors), rest is noisy
+        noisy_mask = self.diffusion.generate_noisy_mask(
+            B, self.num_patches, self.clean_ratio, device
+        )
+        mixed_patches, noise, noisy_mask = self.diffusion.apply_patch_noise(
+            target_patches, noisy_mask, t
+        )
+
+        img_size = int(self.patch_size * (self.num_patches ** 0.5))
+        mixed_imgs = self.unpatchify(mixed_patches, img_size=img_size)
+
+        # Shared encoder sees 25% clean + 75% noisy patches
+        cls_token, patch_tokens = self.encoder(mixed_imgs)
+
+        # Two decoders predict different targets
+        pred_eps = self.decoder(patch_tokens)         # noise prediction
+        pred_pix = self.decoder_pix(patch_tokens)     # pixel reconstruction
+
+        # Loss on the 75% noisy patches
+        loss_eps = self._masked_mse(pred_eps, noise, noisy_mask)
+        loss_pix = self._masked_mse(pred_pix, target_patches, noisy_mask)
+
+        loss = loss_eps + self.pixel_loss_weight * loss_pix
+
+        log_dict = {
+            'loss': loss.detach(),
+            'noisy_loss': loss_eps.detach(),   # eps loss reported as "noisy_loss" for logger compat
+            'clean_loss': loss_pix.detach(),   # pixel loss reported as "clean_loss"
+            't_min': 0,
+            't_max': self.diffusion.num_timesteps,
+            'clean_ratio': self.clean_ratio,
+            't_mean': t.float().mean().detach(),
+        }
         return loss, log_dict
 
     def _masked_mse(self, pred, target, mask):

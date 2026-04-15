@@ -2,7 +2,7 @@
 
 # Data
 data:
-  imagenet_dir: /path/to/imagenet  # should contain train/ and val/
+  imagenet_dir: /lustre1/work/c30636/dataset/imagenet  # should contain train/ and val/
   image_size: 224
   num_workers: 8
 
@@ -58,5 +58,5 @@ probe:
 # Logging
 logging:
   log_dir: ./logs
-  save_every: 20         # save checkpoint every N epochs
+  save_every: 5          # save checkpoint every N epochs
   print_every: 100       # print loss every N steps

@@ -1,0 +1,60 @@
+# SubDiff Pretraining Config - ViT-B/16 - Noise Prediction (epsilon) mode
+
+# Data
+data:
+  imagenet_dir: /lustre1/work/c30636/dataset/imagenet
+  image_size: 224
+  num_workers: 8
+
+# Model
+model:
+  patch_size: 16
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  decoder_embed_dim: 512
+  decoder_depth: 4
+  decoder_num_heads: 8
+
+# Diffusion
+diffusion:
+  num_timesteps: 1000
+  beta_start: 0.0001
+  beta_end: 0.02
+  schedule_type: linear
+  predict_noise: true       # epsilon prediction instead of pixel reconstruction
+
+# Curriculum learning
+curriculum:
+  t_min_start: 800
+  t_min_end: 100
+  t_max_start: 1000
+  t_max_end: 600
+  clean_ratio_start: 0.25
+  clean_ratio_end: 0.05
+  warmup_epochs: 10
+  schedule: cosine
+
+# Training
+training:
+  epochs: 300
+  batch_size: 256
+  lr: 1.5e-4
+  min_lr: 1.0e-6
+  weight_decay: 0.05
+  warmup_epochs: 40
+  optimizer: adamw
+  clip_grad: 3.0
+
+# Linear probe
+probe:
+  eval_every: 20
+  probe_lr: 0.1
+  probe_epochs: 30
+  num_classes: 1000
+
+# Logging
+logging:
+  log_dir: ./logs_eps
+  save_every: 5
+  print_every: 100

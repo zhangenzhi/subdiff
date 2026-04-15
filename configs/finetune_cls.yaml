@@ -2,7 +2,7 @@
 
 # Data
 data:
-  imagenet_dir: /path/to/imagenet
+  imagenet_dir: /lustre1/work/c30636/dataset/imagenet
   image_size: 224
   num_workers: 8
 

@@ -103,7 +103,10 @@ class PatchDiffusion(nn.Module):
         Returns:
             t: (B,) integer timesteps
         """
-        t = torch.randint(int(t_min), int(t_max) + 1, (batch_size,), device=device)
+        # Clamp to valid range [0, num_timesteps - 1]
+        t_min_clamped = max(int(t_min), 0)
+        t_max_clamped = min(int(t_max), self.num_timesteps - 1)
+        t = torch.randint(t_min_clamped, t_max_clamped + 1, (batch_size,), device=device)
         return t
 
     def generate_noisy_mask(self, batch_size, num_patches, clean_ratio, device):
