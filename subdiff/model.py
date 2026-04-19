@@ -5,13 +5,36 @@ Main model that combines ViT encoder/decoder with patch-level diffusion
 and curriculum learning.
 """
 
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 
-from .vit import ViTEncoder, Decoder
+from .vit import ViTEncoder, DiTEncoder, Decoder
 from .diffusion import PatchDiffusion
 from .curriculum import CurriculumScheduler
+
+
+class SinusoidalTimeEmbedding(nn.Module):
+    """Sinusoidal timestep embedding + 2-layer MLP, as in DDPM/DiT."""
+
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Linear(dim * 4, dim),
+        )
+
+    def forward(self, t):
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=t.device, dtype=torch.float32) * -emb)
+        emb = t[:, None].float() * emb[None, :]
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+        return self.mlp(emb)
 
 
 class SubDiff(nn.Module):
@@ -40,33 +63,76 @@ class SubDiff(nn.Module):
                  total_epochs=300, curriculum_cfg=None,
                  predict_noise=False,
                  mae_masking=False, mask_ratio=0.25,
-                 dual_decoder=False, clean_ratio=0.25, pixel_loss_weight=1.0):
+                 dual_decoder=False, clean_ratio=0.25, pixel_loss_weight=1.0,
+                 naive_mae=False,
+                 naive_ddpm=False,
+                 qk_norm=False,
+                 dit_minimal_head=False,
+                 use_indicators=False,
+                 use_conv_refine=False,
+                 loss_weighting='simple', snr_gamma=5.0,
+                 pos_embed_type='sincos'):
         super().__init__()
 
         self.patch_size = patch_size
         self.num_patches = (img_size // patch_size) ** 2
         self.patch_dim = patch_size ** 2 * in_channels
 
-        # Encoder
-        self.encoder = ViTEncoder(
-            img_size=img_size, patch_size=patch_size, in_channels=in_channels,
-            embed_dim=embed_dim, depth=depth, num_heads=num_heads
-        )
+        # Encoder selection:
+        #   - Any diffusion variant (naive_ddpm, predict_noise, dual_decoder)
+        #     uses DiTEncoder with per-block adaLN-Zero time conditioning
+        #     (prevents time-signal dilution through the 12-layer stack).
+        #   - Plain pixel-reconstruction pretraining uses ViTEncoder.
+        use_dit_encoder = naive_ddpm or predict_noise or dual_decoder
+        if use_dit_encoder:
+            self.encoder = DiTEncoder(
+                img_size=img_size, patch_size=patch_size, in_channels=in_channels,
+                embed_dim=embed_dim, depth=depth, num_heads=num_heads,
+                qk_norm=qk_norm,
+                pos_embed_type=pos_embed_type,
+            )
+        else:
+            self.encoder = ViTEncoder(
+                img_size=img_size, patch_size=patch_size, in_channels=in_channels,
+                embed_dim=embed_dim, depth=depth, num_heads=num_heads,
+                qk_norm=qk_norm,
+                pos_embed_type=pos_embed_type,
+            )
+        self._use_dit_encoder = use_dit_encoder
 
-        # Decoder (primary: noise prediction if dual_decoder, else single-task)
-        self.decoder = Decoder(
-            patch_size=patch_size, num_patches=self.num_patches,
-            encoder_dim=embed_dim, decoder_dim=decoder_dim,
-            depth=decoder_depth, num_heads=decoder_num_heads
-        )
+        # Decoder selection:
+        #  - dit_minimal_head: DiT-style single Linear head, zero-initialized.
+        #    Skips the 4-layer external Decoder. Works for naive_ddpm AND
+        #    SubDiff variants. The 4-layer Decoder without time conditioning
+        #    is what destroyed time-conditioned representations from encoder,
+        #    breaking sampling. Replacing with single Linear restores it.
+        #  - else: 4-layer Decoder transformer (default).
+        self.dit_minimal_head = dit_minimal_head
+        if self.dit_minimal_head:
+            self.decoder = nn.Linear(embed_dim, self.patch_dim, bias=True)
+            nn.init.zeros_(self.decoder.weight)
+            nn.init.zeros_(self.decoder.bias)
+        else:
+            self.decoder = Decoder(
+                patch_size=patch_size, num_patches=self.num_patches,
+                encoder_dim=embed_dim, decoder_dim=decoder_dim,
+                depth=decoder_depth, num_heads=decoder_num_heads,
+                qk_norm=qk_norm,
+            )
 
         # Optional second decoder for pixel reconstruction (dual-objective pretraining)
         if dual_decoder:
-            self.decoder_pix = Decoder(
-                patch_size=patch_size, num_patches=self.num_patches,
-                encoder_dim=embed_dim, decoder_dim=decoder_dim,
-                depth=decoder_depth, num_heads=decoder_num_heads
-            )
+            if self.dit_minimal_head:
+                self.decoder_pix = nn.Linear(embed_dim, self.patch_dim, bias=True)
+                nn.init.zeros_(self.decoder_pix.weight)
+                nn.init.zeros_(self.decoder_pix.bias)
+            else:
+                self.decoder_pix = Decoder(
+                    patch_size=patch_size, num_patches=self.num_patches,
+                    encoder_dim=embed_dim, decoder_dim=decoder_dim,
+                    depth=decoder_depth, num_heads=decoder_num_heads,
+                    qk_norm=qk_norm,
+                )
         else:
             self.decoder_pix = None
 
@@ -83,12 +149,64 @@ class SubDiff(nn.Module):
             total_epochs=total_epochs, **curriculum_cfg
         )
 
+        # Optional indicator embeddings.
+        #   - use_indicators=True: adds learnable noise/clean indicator to
+        #     each patch, telling encoder explicitly which are anchors.
+        #     Creates a training-inference mismatch (at sampling, all patches
+        #     are noisy so all get noise_indicator).
+        #   - use_indicators=False (default): encoder must learn clean vs
+        #     noisy from content alone. Matches inference distribution.
+        self.use_indicators = use_indicators
+        if use_indicators:
+            self.noise_indicator = nn.Parameter(torch.zeros(1, 1, embed_dim))
+            self.clean_indicator = nn.Parameter(torch.zeros(1, 1, embed_dim))
+            nn.init.trunc_normal_(self.noise_indicator, std=0.02)
+            nn.init.trunc_normal_(self.clean_indicator, std=0.02)
+
+        # Loss weighting scheme (applies to ε prediction paths).
+        #  - 'simple': uniform weighting (standard DDPM, what we've been using)
+        #  - 'min_snr': Min-SNR-γ (Hang et al. 2023). Weight per sample
+        #    = min(SNR(t), gamma). Downweights the high-t regime where the
+        #    model can only predict the dataset mean (mode collapse attractor),
+        #    and caps low-t weighting at gamma to avoid fine-detail over-focus.
+        #    Used in SD3 / PixArt-Σ / FLUX.
+        self.loss_weighting = loss_weighting
+        self.snr_gamma = snr_gamma
+
+        # Optional Conv refinement head: small residual Conv stack applied
+        # after unpatchify, to smooth patch boundaries. Addresses the
+        # "patch-independent generation" failure mode of pure ViT + Linear head
+        # in pixel space (what VAE's Conv decoder does implicitly in latent DiT).
+        # Final Conv is zero-initialized so refinement starts as identity.
+        self.use_conv_refine = use_conv_refine
+        if use_conv_refine:
+            self.conv_refine = nn.Sequential(
+                nn.Conv2d(in_channels, 64, kernel_size=3, padding=1),
+                nn.SiLU(),
+                nn.Conv2d(64, in_channels, kernel_size=3, padding=1),
+            )
+            nn.init.zeros_(self.conv_refine[-1].weight)
+            nn.init.zeros_(self.conv_refine[-1].bias)
+        else:
+            self.conv_refine = None
+
         self.predict_noise = predict_noise
         self.mae_masking = mae_masking
         self.mask_ratio = mask_ratio
         self.dual_decoder = dual_decoder
         self.clean_ratio = clean_ratio
         self.pixel_loss_weight = pixel_loss_weight
+        self.naive_mae = naive_mae
+        self.naive_ddpm = naive_ddpm
+
+        # Time embedding: used by naive_ddpm (adaLN per block) and by
+        # SubDiff eps-prediction paths (additive to patch tokens).
+        # For pixel-only prediction without predict_noise, t is irrelevant
+        # so we skip creating time_embed to avoid unused params.
+        if naive_ddpm or predict_noise or dual_decoder:
+            self.time_embed = SinusoidalTimeEmbedding(embed_dim)
+        else:
+            self.time_embed = None
 
     def patchify(self, imgs):
         """Convert images to patch sequences.
@@ -117,6 +235,84 @@ class SubDiff(nn.Module):
                          h=h, w=w, p1=p, p2=p, c=3)
         return imgs
 
+    def _eps_weight(self, t):
+        """Per-sample loss weight for ε prediction based on self.loss_weighting.
+
+        Args:
+            t: (B,) integer timesteps
+        Returns:
+            (B,) weights, already normalized so mean ≈ 1 on uniform t (keeps
+            loss magnitude comparable to simple weighting for logging).
+        """
+        if self.loss_weighting == 'simple':
+            return torch.ones_like(t, dtype=torch.float32)
+        # Min-SNR-γ
+        alpha_bar = self.diffusion.alphas_cumprod[t].float()
+        snr = alpha_bar / (1.0 - alpha_bar).clamp(min=1e-8)
+        w = torch.clamp(snr, max=self.snr_gamma)
+        # Normalize so expected weight ≈ 1 (for stable logging / lr tuning)
+        w = w / w.mean().clamp(min=1e-8)
+        return w
+
+    def _apply_conv_refine(self, pred_patches):
+        """If conv_refine is enabled, apply residual Conv post-processing in
+        image space to smooth patch boundaries. Returns refined patches
+        (still in patch-space shape for downstream loss computation)."""
+        if self.conv_refine is None:
+            return pred_patches
+        img_size = int(self.patch_size * (self.num_patches ** 0.5))
+        pred_img = self.unpatchify(pred_patches, img_size=img_size)
+        pred_img = pred_img + self.conv_refine(pred_img)
+        return self.patchify(pred_img)
+
+    def _encode_with_indicators(self, mixed_imgs, noisy_mask, t=None):
+        """Encode with clean/noisy indicator embeddings + time conditioning.
+
+        Each patch token receives:
+          1. Patch pixel embedding (from Conv2d patch_embed)
+          2. Clean/noisy indicator embedding (tells encoder which patches are anchors)
+          3. Positional embedding (added inside encoder's forward_patches)
+          4. Time conditioning:
+             - DiTEncoder: per-block adaLN-Zero with time embedding c
+             - ViTEncoder: additive time_emb broadcast to all patches (fallback)
+
+        Args:
+            mixed_imgs: (B, C, H, W) image with clean + noisy patches mixed
+            noisy_mask: (B, N) bool mask, True = noisy, False = clean
+            t: (B,) integer timesteps
+        Returns:
+            cls_token: (B, D), patch_tokens: (B, N, D)
+        """
+        enc = self.encoder
+        B = mixed_imgs.shape[0]
+        x = enc.patch_embed(mixed_imgs)  # (B, N, D)
+
+        # Optional: add indicator embeddings per patch
+        if self.use_indicators:
+            indicator = torch.where(
+                noisy_mask.unsqueeze(-1),
+                self.noise_indicator.expand(B, x.shape[1], -1),
+                self.clean_indicator.expand(B, x.shape[1], -1),
+            )
+            x = x + indicator
+
+        if self._use_dit_encoder:
+            # DiTEncoder: time enters through per-block adaLN-Zero
+            c = self.time_embed(t)  # (B, D)
+            return enc.forward_patches(x, c)
+        else:
+            # ViTEncoder fallback: additive time embedding once before blocks
+            if t is not None and self.time_embed is not None:
+                t_emb = self.time_embed(t)
+                x = x + t_emb.unsqueeze(1)
+            cls = enc.cls_token.expand(B, -1, -1)
+            x = torch.cat([cls, x], dim=1)
+            x = x + enc.pos_embed
+            for blk in enc.blocks:
+                x = blk(x)
+            x = enc.norm(x)
+            return x[:, 0], x[:, 1:]
+
     def forward(self, imgs, epoch=0):
         """
         Args:
@@ -127,6 +323,10 @@ class SubDiff(nn.Module):
             loss: reconstruction loss
             log_dict: dict with metrics for logging
         """
+        if self.naive_ddpm:
+            return self._forward_naive_ddpm(imgs, epoch)
+        if self.naive_mae:
+            return self._forward_naive_mae(imgs, epoch)
         if self.dual_decoder:
             return self._forward_dual(imgs, epoch)
         if self.mae_masking:
@@ -157,11 +357,12 @@ class SubDiff(nn.Module):
         # Reconstruct image from mixed patches for encoder input
         mixed_imgs = self.unpatchify(mixed_patches, img_size=int(self.patch_size * (self.num_patches ** 0.5)))
 
-        # Encode
-        cls_token, patch_tokens = self.encoder(mixed_imgs)
+        # Encode with clean/noisy indicators + time embedding
+        cls_token, patch_tokens = self._encode_with_indicators(mixed_imgs, noisy_mask, t)
 
         # Decode
         pred = self.decoder(patch_tokens)  # (B, N, patch_dim)
+        pred = self._apply_conv_refine(pred)
 
         if self.predict_noise:
             # Noise prediction: target is the noise added to patches
@@ -171,8 +372,9 @@ class SubDiff(nn.Module):
             # Pixel reconstruction: target is the clean patches
             target = target_patches
 
-        # Primary loss on noisy regions
-        noisy_loss = self._masked_mse(pred, target, noisy_mask)
+        # Primary loss on noisy regions (weighted for ε prediction only)
+        w = self._eps_weight(t) if self.predict_noise else None
+        noisy_loss = self._masked_mse(pred, target, noisy_mask, weight=w)
 
         # Secondary loss on clean regions
         clean_mask = ~noisy_mask
@@ -245,13 +447,108 @@ class SubDiff(nn.Module):
         }
         return loss, log_dict
 
+    def _encode_with_time(self, noisy_imgs, t):
+        """Encode with timestep conditioning.
+
+        Uses DiTEncoder's per-block adaLN-Zero modulation: time embedding
+        is fed into every transformer block, producing scale/shift/gate for
+        both attention and MLP sub-layers. This is the standard conditioning
+        mechanism for transformer-based DDPM (DiT, PixArt, SD3).
+        """
+        time_emb = self.time_embed(t)  # (B, D)
+        return self.encoder(noisy_imgs, time_emb)
+
+    def _forward_naive_ddpm(self, imgs, epoch=0):
+        """Naive DDPM-ViT pretraining (standard DDPM training on a ViT).
+
+        - Per-image t ~ Uniform[0, T) (standard DDPM).
+        - Add noise to the ENTIRE image (no patch mixing, no clean anchors).
+        - ViT encoder receives the noisy image with timestep conditioning
+          injected via the cls_token.
+        - Decoder predicts noise epsilon for every patch.
+        - Loss: MSE on all patches (standard DDPM training objective).
+        """
+        B = imgs.shape[0]
+        device = imgs.device
+        img_size = int(self.patch_size * (self.num_patches ** 0.5))
+
+        # Standard DDPM forward: uniform t, noise the whole image
+        target_patches = self.patchify(imgs)  # (B, N, patch_dim)
+        t = torch.randint(0, self.diffusion.num_timesteps, (B,), device=device)
+        noisy_patches, noise = self.diffusion.add_noise(target_patches, t)
+        noisy_imgs = self.unpatchify(noisy_patches, img_size=img_size)
+
+        # Encoder with time conditioning
+        cls_token, patch_tokens = self._encode_with_time(noisy_imgs, t)
+
+        # Decoder predicts noise on all patches
+        pred_noise = self.decoder(patch_tokens)  # (B, N, patch_dim)
+        pred_noise = self._apply_conv_refine(pred_noise)
+
+        # Weighted MSE (uniform or Min-SNR-γ)
+        w = self._eps_weight(t)                                  # (B,)
+        per_sample = ((pred_noise - noise) ** 2).mean(dim=(1, 2))  # (B,)
+        loss = (w * per_sample).mean()
+
+        log_dict = {
+            'loss': loss.detach(),
+            'noisy_loss': loss.detach(),
+            'clean_loss': torch.tensor(0.0, device=device),
+            't_min': 0,
+            't_max': self.diffusion.num_timesteps,
+            'clean_ratio': 0.0,
+            't_mean': t.float().mean().detach(),
+        }
+        return loss, log_dict
+
+    def _forward_naive_mae(self, imgs, epoch=0):
+        """Naive MAE pretraining (Kaiming He et al. 2021).
+
+        - No diffusion noise — pure random masking.
+        - mask_ratio of patches are dropped (typically 0.75).
+        - Encoder only processes (1 - mask_ratio) clean visible patches (efficient).
+        - Decoder fills mask tokens at dropped positions, reconstructs pixels.
+        - Loss: MSE on MASKED patches only (reconstruct what encoder didn't see).
+        """
+        B = imgs.shape[0]
+        target_patches = self.patchify(imgs)  # (B, N, patch_dim)
+
+        # Encoder sees clean visible patches (mask_ratio fraction masked out)
+        cls_token, visible_tokens, ids_restore, mask = self.encoder.forward_masked(
+            imgs, mask_ratio=self.mask_ratio
+        )
+        # mask: (B, N) with 1 = masked, 0 = visible
+
+        # Decoder reconstructs all patches (but only masked are scored)
+        pred = self.decoder.forward_masked(visible_tokens, ids_restore)
+
+        visible_mask = (mask == 0)
+        masked_mask = (mask == 1)
+
+        # MAE loss: reconstruction MSE on masked patches only
+        loss = self._masked_mse(pred, target_patches, masked_mask)
+
+        # Track visible loss as diagnostic (not in total loss)
+        vis_loss = self._masked_mse(pred, target_patches, visible_mask)
+
+        log_dict = {
+            'loss': loss.detach(),
+            'noisy_loss': loss.detach(),       # report masked loss as 'noisy_loss' for logger compat
+            'clean_loss': vis_loss.detach(),   # report visible loss as 'clean_loss'
+            't_min': 0, 't_max': 0,            # no timesteps in naive MAE
+            'clean_ratio': 1 - self.mask_ratio,
+            't_mean': torch.tensor(0.0, device=imgs.device),
+        }
+        return loss, log_dict
+
     def _forward_dual(self, imgs, epoch=0):
         """Dual-decoder pretraining: shared encoder + two heads.
 
         Design:
           - Encoder sees clean(clean_ratio) + noisy(1 - clean_ratio) patches
             (no MAE masking — clean patches serve as spatial anchors)
-          - t ~ Uniform[0, T) per image (standard DDPM, no curriculum)
+          - t sampled from curriculum-controlled [t_min, t_max] range
+            (if curriculum is degenerate to [0, T], this is standard DDPM uniform)
           - decoder      → predicts noise ε for each patch (DDPM target)
           - decoder_pix  → reconstructs clean pixel values (MAE target)
           - Loss on the NOISY patches only (clean patches are trivial for both heads)
@@ -260,10 +557,13 @@ class SubDiff(nn.Module):
         B = imgs.shape[0]
         device = imgs.device
 
+        # Use curriculum-controlled t range (allows ablation: curriculum vs uniform)
+        curriculum_state = self.curriculum.get_state(epoch)
+        t_min, t_max = curriculum_state['t_min'], curriculum_state['t_max']
+
         target_patches = self.patchify(imgs)  # (B, N, patch_dim)
 
-        # Standard DDPM: per-image full-range t
-        t = torch.randint(0, self.diffusion.num_timesteps, (B,), device=device)
+        t = self.diffusion.sample_timesteps(B, t_min, t_max, device)
         # clean_ratio fraction stays clean (spatial anchors), rest is noisy
         noisy_mask = self.diffusion.generate_noisy_mask(
             B, self.num_patches, self.clean_ratio, device
@@ -275,15 +575,19 @@ class SubDiff(nn.Module):
         img_size = int(self.patch_size * (self.num_patches ** 0.5))
         mixed_imgs = self.unpatchify(mixed_patches, img_size=img_size)
 
-        # Shared encoder sees 25% clean + 75% noisy patches
-        cls_token, patch_tokens = self.encoder(mixed_imgs)
+        # Shared encoder with clean/noisy indicators + time
+        cls_token, patch_tokens = self._encode_with_indicators(mixed_imgs, noisy_mask, t)
 
         # Two decoders predict different targets
         pred_eps = self.decoder(patch_tokens)         # noise prediction
         pred_pix = self.decoder_pix(patch_tokens)     # pixel reconstruction
+        pred_eps = self._apply_conv_refine(pred_eps)
+        pred_pix = self._apply_conv_refine(pred_pix)
 
-        # Loss on the 75% noisy patches
-        loss_eps = self._masked_mse(pred_eps, noise, noisy_mask)
+        # Loss on the 75% noisy patches. Weight ε loss by Min-SNR-γ if enabled;
+        # pix loss stays unweighted (target is pixel values, not noise).
+        w = self._eps_weight(t)
+        loss_eps = self._masked_mse(pred_eps, noise, noisy_mask, weight=w)
         loss_pix = self._masked_mse(pred_pix, target_patches, noisy_mask)
 
         loss = loss_eps + self.pixel_loss_weight * loss_pix
@@ -292,21 +596,33 @@ class SubDiff(nn.Module):
             'loss': loss.detach(),
             'noisy_loss': loss_eps.detach(),   # eps loss reported as "noisy_loss" for logger compat
             'clean_loss': loss_pix.detach(),   # pixel loss reported as "clean_loss"
-            't_min': 0,
-            't_max': self.diffusion.num_timesteps,
+            't_min': t_min,
+            't_max': t_max,
             'clean_ratio': self.clean_ratio,
             't_mean': t.float().mean().detach(),
         }
         return loss, log_dict
 
-    def _masked_mse(self, pred, target, mask):
-        """Compute MSE loss only on masked (selected) patches."""
+    def _masked_mse(self, pred, target, mask, weight=None):
+        """Compute MSE loss only on masked (selected) patches.
+
+        Args:
+            pred, target: (B, N, patch_dim)
+            mask: (B, N) bool selection mask
+            weight: (B,) optional per-sample scalar weight (for loss weighting
+                schemes like Min-SNR-γ). If None, uniform weighting.
+        """
         if mask.sum() == 0:
             return torch.tensor(0.0, device=pred.device)
         diff = (pred - target) ** 2
-        diff = diff.mean(dim=-1)  # (B, N) mean over patch_dim
-        loss = (diff * mask.float()).sum() / mask.float().sum()
-        return loss
+        diff = diff.mean(dim=-1)  # (B, N)
+        mask_f = mask.float()
+        if weight is not None:
+            # Per-sample mean of masked-patch losses, then weighted average
+            denom = mask_f.sum(dim=1).clamp(min=1e-8)     # (B,)
+            per_sample = (diff * mask_f).sum(dim=1) / denom  # (B,)
+            return (weight * per_sample).mean()
+        return (diff * mask_f).sum() / mask_f.sum()
 
     def get_encoder(self):
         """Return the encoder for downstream evaluation."""

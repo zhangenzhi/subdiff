@@ -10,7 +10,10 @@ and diffusion noise prediction (DDPM-style) in a single framework.
 2. [designs.md](designs.md) — Evolution of design choices: original SubDiff →
    noise prediction → MAE-masked → dual-decoder.
 3. [experiments.md](experiments.md) — Experiment log with quantitative results.
-4. [todo.md](todo.md) — Open questions and future directions.
+4. [stability.md](stability.md) — Training stability analysis: why ε-prediction
+   on plain ViT diverges, attention entropy collapse hypothesis, and planned
+   QK-Norm + EMA fixes.
+5. [todo.md](todo.md) — Open questions and future directions.
 
 ## One-sentence summary
 

@@ -1,10 +1,6 @@
-# SubDiff Dual-Decoder Pretraining
-# - Encoder sees 25% clean + 75% noisy patches (clean = spatial anchors)
-# - Per-image t ~ Uniform[0, 1000) (standard DDPM, no curriculum)
-# - Decoder A (self.decoder):     noise prediction (ε) — aligns with DDPM downstream
-# - Decoder B (self.decoder_pix): clean-pixel reconstruction — MAE-style content learning
-# - Loss on 75% noisy patches only (clean patches are trivial for both heads)
-# - L = L_eps + pixel_loss_weight * L_pix
+# SubDiff: single ε decoder + QK-Norm + clean anchors
+# Clean design: 25% clean patches as spatial anchors, 75% noisy,
+# full-range t, predict noise, QK-Norm for stability.
 
 data:
   imagenet_dir: /lustre1/work/c30636/dataset/imagenet
@@ -19,10 +15,7 @@ model:
   decoder_embed_dim: 512
   decoder_depth: 4
   decoder_num_heads: 8
-  dual_decoder: true
-  clean_ratio: 0.25         # 25% clean anchors, 75% noisy
-  pixel_loss_weight: 1.0    # weight of pixel recon loss (eps loss weight is 1)
-  qk_norm: true             # prevent attention entropy collapse
+  qk_norm: true
   dit_minimal_head: true    # single Linear head (zero-init) instead of 4-layer Decoder
   use_indicators: false     # no clean/noisy indicator; model must infer from content
 
@@ -31,8 +24,9 @@ diffusion:
   beta_start: 0.0001
   beta_end: 0.02
   schedule_type: linear
+  predict_noise: true
 
-# Curriculum is unused (t is uniform full-range), kept for compatibility.
+# No curriculum — full-range t, fixed clean_ratio
 curriculum:
   t_min_start: 0
   t_min_end: 0
@@ -48,9 +42,9 @@ training:
   batch_size: 256
   lr: 1.0e-4
   min_lr: 1.0e-6
-  weight_decay: 0.0        # DiT standard: no weight decay
+  weight_decay: 0.0
   warmup_epochs: 0
-  lr_schedule: constant    # DDPM/DiT standard
+  lr_schedule: constant
   optimizer: adamw
   clip_grad: 1.0
 
@@ -61,6 +55,6 @@ probe:
   num_classes: 1000
 
 logging:
-  log_dir: ./logs_dual_clean
+  log_dir: ./logs_eps_clean
   save_every: 5
   print_every: 100

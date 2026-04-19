@@ -23,11 +23,41 @@ All runs: ViT-B/16 backbone, ImageNet-1K, 4× H100, bf16 mixed precision.
 - Discarded before meaningful training due to design flaw: visible patches
   are all noisy, no clean anchors, at high t the encoder has no spatial signal.
 
-### Run 4: Dual-decoder (in progress)
+### Run 4: Dual-decoder (early / superseded)
 - Config: `pretrain_vit_b16_dual.yaml`
-- Log dir: `logs_dual/`
+- Log dir: `logs_dual/` then `logs_dual_qknorm/`
 - First attempt crashed: DDP found unused parameters. Fix: DDP with
-  `find_unused_parameters=True` when `dual_decoder` or `mae_masking`.
+  `find_unused_parameters=True`.
+- Eventually exposed stability issues (see `stability.md`); superseded by
+  Run 7 (dual_dit) after architecture cleanup.
+
+### Run 5: naive DDPM-ViT (stability baseline for generation)
+- Configs: several iterations leading to
+  `pretrain_vit_b16_naive_ddpm_minimal.yaml`
+- Key final configuration: DiTEncoder (per-block adaLN-Zero) + QK-Norm +
+  single zero-init Linear head + constant lr 1e-4 + no weight decay.
+- Log dir: `logs_naive_ddpm_minimal/`
+- Status (epoch 5+): training loss 0.05-0.10, converging cleanly. Sampling
+  produces patch-level structure (clear breakthrough from earlier pure-noise
+  outputs).
+
+### Run 6: SubDiff eps_qknorm with DiTEncoder (single ε head)
+- Config: `pretrain_vit_b16_eps_qknorm.yaml`
+- Log dir: `logs_eps_dit/`
+- Same backbone as Run 5 but with SubDiff's 25% clean anchors, noise/clean
+  indicator embeddings, predict_noise=True.
+- Epoch 0 end: avg_loss 0.117, ε loss ≈ naive_ddpm.
+
+### Run 7: SubDiff dual with DiTEncoder (ε + pixel heads)
+- Config: `pretrain_vit_b16_dual.yaml`
+- Log dir: `logs_dual_dit/`
+- Same backbone as Runs 5-6 but with dual heads: ε prediction + pixel
+  reconstruction, both with minimal (zero-init Linear) heads. Loss computed
+  only on noisy patches.
+- Epoch 0 end: avg_loss 0.527, ε loss **0.099**, pix loss 0.33.
+- **ε loss ~17% lower than Run 5 (0.099 vs 0.117) with identical
+  architecture** — tentative evidence of positive transfer from pix head
+  to ε head (see stability.md § "Positive finding").
 
 ## Downstream finetuning
 

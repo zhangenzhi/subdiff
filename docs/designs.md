@@ -115,4 +115,32 @@ to work from, even at high t.
 | 1. Original | yes (curriculum) | curriculum | pixel | 1 | done, +11% cls |
 | 2. eps pred | yes (curriculum) | curriculum | epsilon | 1 | trained, rebound issue |
 | 3. MAE-mask | no | full range | epsilon | 1 | not finalized (no anchor) |
-| 4. Dual | yes (fixed 25%) | full range | pixel + epsilon | 2 | current run |
+| 4. Dual (early) | yes (fixed 25%) | full range | pixel + epsilon | 2 (4-layer each) | unstable, see stability.md |
+| 5. Stability recipe | varies | varies | varies | 1 zero-init Linear head | **stable for 300+ epochs** |
+
+## 5. Stability recipe (current working architecture)
+
+After diagnosing and fixing the ε-prediction stability issues (see
+[stability.md](stability.md)), the working architecture for all diffusion
+variants is:
+
+- **Encoder**: DiTEncoder with per-block adaLN-Zero time conditioning.
+  All SubDiff diffusion variants (naive_ddpm, predict_noise, dual_decoder)
+  use this, not the plain ViTEncoder.
+- **QK-Norm**: LayerNorm per head on Q and K before the attention dot
+  product. Prevents attention entropy collapse.
+- **Minimal head**: single zero-init Linear (`embed_dim → patch_dim`)
+  replacing the 4-layer Decoder transformer. The 4-layer Decoder, being
+  time-unconditioned, washed out the carefully-learned time-dependent
+  representations from the encoder.
+- **Clean/noisy indicator embeddings**: learnable `(1, 1, D)` vectors
+  added to patch tokens in SubDiff variants to tell encoder which patches
+  are clean anchors vs noisy. Same additive injection as time embedding
+  in ViTEncoder fallback, or as extra signal alongside adaLN in DiTEncoder.
+- **Constant lr 1e-4**, no weight decay, no warmup, bf16 mixed precision,
+  grad clip 1.0.
+
+Under this recipe, all three diffusion variants (naive_ddpm_minimal,
+eps_qknorm + DiT, dual + DiT) converge at essentially the same rate on
+ε loss (~0.117 at end of epoch 0), with dual showing a tentative ~17%
+advantage that may persist or disappear — see todo.md Priority 1.

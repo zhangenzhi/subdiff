@@ -62,9 +62,131 @@ def save_grid(images_list, titles, save_path, nrow=4):
     print(f"  Saved: {save_path}")
 
 
+def _noise_to_vis(noise_img):
+    """Visualize a noise-map tensor (any range) as a [0, 1] image.
+    ε̂ is ~N(0, 1), so scale by 0.3 + 0.5 maps ±2σ region into the viewable range.
+    """
+    return (noise_img * 0.3 + 0.5).clamp(0, 1)
+
+
+def _ddpm_one_step_reverse(model, noisy_patches, pred_noise_patches, t):
+    """Compute x_{t-1} via the standard DDPM posterior mean, deterministically
+    (no stochastic noise injection). This is what the model actually produces
+    in one DDPM reverse step, given its ε̂ prediction.
+
+    x_{t-1} should be only slightly less noisy than x_t, NOT fully clean.
+    """
+    diff = model.diffusion
+    alpha_bar_t = diff.alphas_cumprod[t][:, None, None]
+    sqrt_alpha_bar_t = alpha_bar_t.sqrt()
+    sqrt_one_minus_t = (1 - alpha_bar_t).sqrt()
+
+    # Predicted clean x_0 from ε̂ (intermediate, used in posterior formula)
+    pred_x0 = (noisy_patches - sqrt_one_minus_t * pred_noise_patches) / sqrt_alpha_bar_t
+    pred_x0 = pred_x0.clamp(-3, 3)
+
+    t_prev = (t - 1).clamp(min=0)
+    alpha_bar_prev = diff.alphas_cumprod[t_prev][:, None, None]
+    beta_t = diff.betas[t][:, None, None]
+    alpha_t = 1.0 - beta_t
+
+    posterior_mean = (
+        alpha_bar_prev.sqrt() * beta_t / (1 - alpha_bar_t) * pred_x0
+        + alpha_t.sqrt() * (1 - alpha_bar_prev) / (1 - alpha_bar_t) * noisy_patches
+    )
+    return posterior_mean, pred_x0
+
+
+@torch.no_grad()
+def _visualize_naive_ddpm(model, imgs, epoch, save_dir, device, n_samples=4):
+    """Naive DDPM-ViT viz — shows the model's actual single-step behavior:
+      col 1: Original x_0 (ground truth)
+      col 2: Noisy input x_t (at t=500)
+      col 3: ε̂ (model's raw predicted noise, visualized as a map)
+      col 4: x_{t-1} — one DDPM reverse step (slightly denoised, NOT fully clean)
+      col 5: pred_x̂_0 — model's "optimistic" estimate if ε̂ were perfect
+             (what the OLD visualization incorrectly showed as main output)
+    """
+    B = imgs.shape[0]
+    img_size = int(model.patch_size * (model.num_patches ** 0.5))
+
+    target_patches = model.patchify(imgs)
+    t = torch.full((B,), 500, device=device, dtype=torch.long)
+    noisy_patches, _ = model.diffusion.add_noise(target_patches, t)
+    noisy_imgs = model.unpatchify(noisy_patches, img_size=img_size)
+
+    cls_token, patch_tokens = model._encode_with_time(noisy_imgs, t)
+    pred_noise_patches = model.decoder(patch_tokens)
+    pred_noise_patches = model._apply_conv_refine(pred_noise_patches)
+
+    x_prev_patches, pred_x0_patches = _ddpm_one_step_reverse(
+        model, noisy_patches, pred_noise_patches, t)
+
+    pred_noise_img = model.unpatchify(pred_noise_patches, img_size=img_size)
+    x_prev_img = model.unpatchify(x_prev_patches, img_size=img_size)
+    pred_x0_img = model.unpatchify(pred_x0_patches, img_size=img_size)
+
+    clean_vis = denormalize(imgs)
+    noisy_vis = denormalize(noisy_imgs)
+    eps_vis = _noise_to_vis(pred_noise_img)
+    xprev_vis = denormalize(x_prev_img)
+    x0hat_vis = denormalize(pred_x0_img)
+
+    titles = [
+        "Original x_0",
+        "Noisy x_t (t=500)",
+        "Predicted ε̂",
+        "x_{t-1} (one DDPM step)",
+        "x̂_0 (lookahead)",
+    ]
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f"vis_epoch_{epoch:04d}.png")
+    save_grid([clean_vis, noisy_vis, eps_vis, xprev_vis, x0hat_vis],
+              titles, save_path, nrow=n_samples)
+
+
+@torch.no_grad()
+def _visualize_naive_mae(model, imgs, epoch, save_dir, device, n_samples=4):
+    """Naive MAE viz: Original | Masked Input | Reconstruction."""
+    B = imgs.shape[0]
+    img_size = int(model.patch_size * (model.num_patches ** 0.5))
+
+    cls_token, visible_tokens, ids_restore, mask = model.encoder.forward_masked(
+        imgs, mask_ratio=model.mask_ratio
+    )
+    pred_patches = model.decoder.forward_masked(visible_tokens, ids_restore)
+
+    # Build "masked input" = clean visible, gray for masked
+    target_patches = model.patchify(imgs)
+    mask_expanded = mask.unsqueeze(-1).bool()
+    masked_input_patches = torch.where(mask_expanded, torch.zeros_like(target_patches),
+                                        target_patches)
+    masked_input_imgs = model.unpatchify(masked_input_patches, img_size=img_size)
+    recon_imgs = model.unpatchify(pred_patches, img_size=img_size)
+
+    clean_vis = denormalize(imgs)
+    masked_vis = denormalize(masked_input_imgs)
+    recon_vis = denormalize(recon_imgs)
+
+    titles = [
+        "Original",
+        f"Masked Input (mask_ratio={model.mask_ratio})",
+        "Reconstruction",
+    ]
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f"vis_epoch_{epoch:04d}.png")
+    save_grid([clean_vis, masked_vis, recon_vis], titles, save_path, nrow=n_samples)
+
+
 @torch.no_grad()
 def _visualize_dual(model, imgs, epoch, save_dir, device, n_samples=4):
-    """Dual-decoder viz: Original | Noisy Input | Eps-recon | Pix-recon."""
+    """Dual-decoder viz — shows one single-step reverse (not lookahead):
+      col 1: Original x_0
+      col 2: Noisy Input x_t (25% clean + 75% noisy, t=500)
+      col 3: ε̂ (eps-decoder raw output)
+      col 4: x_{t-1} (one DDPM reverse step from ε head)
+      col 5: Pix-decoder direct output (x_0 prediction from pix head)
+    """
     B = imgs.shape[0]
     img_size = int(model.patch_size * (model.num_patches ** 0.5))
 
@@ -73,36 +195,43 @@ def _visualize_dual(model, imgs, epoch, save_dir, device, n_samples=4):
     noisy_mask = model.diffusion.generate_noisy_mask(
         B, model.num_patches, model.clean_ratio, device
     )
-    mixed_patches, noise, noisy_mask = model.diffusion.apply_patch_noise(
+    mixed_patches, _, noisy_mask = model.diffusion.apply_patch_noise(
         target_patches, noisy_mask, t
     )
     mixed_imgs = model.unpatchify(mixed_patches, img_size=img_size)
 
-    cls_token, patch_tokens = model.encoder(mixed_imgs)
+    if getattr(model, '_use_dit_encoder', False):
+        cls_token, patch_tokens = model._encode_with_indicators(mixed_imgs, noisy_mask, t)
+    else:
+        cls_token, patch_tokens = model.encoder(mixed_imgs)
     pred_eps = model.decoder(patch_tokens)
     pred_pix = model.decoder_pix(patch_tokens)
+    pred_eps = model._apply_conv_refine(pred_eps)
+    pred_pix = model._apply_conv_refine(pred_pix)
 
-    # Reconstruct from predicted noise
-    sqrt_alpha = model.diffusion.sqrt_alphas_cumprod[t][:, None, None]
-    sqrt_one_minus = model.diffusion.sqrt_one_minus_alphas_cumprod[t][:, None, None]
-    eps_recon_patches = (mixed_patches - sqrt_one_minus * pred_eps) / sqrt_alpha
-    eps_recon_imgs = model.unpatchify(eps_recon_patches, img_size=img_size)
-    pix_recon_imgs = model.unpatchify(pred_pix, img_size=img_size)
+    # One-step DDPM reverse using ε head
+    x_prev_patches, _ = _ddpm_one_step_reverse(model, mixed_patches, pred_eps, t)
+    x_prev_img = model.unpatchify(x_prev_patches, img_size=img_size)
+    pred_eps_img = model.unpatchify(pred_eps, img_size=img_size)
+    pred_pix_img = model.unpatchify(pred_pix, img_size=img_size)
 
     clean_vis = denormalize(imgs)
     noisy_vis = denormalize(mixed_imgs)
-    eps_vis = denormalize(eps_recon_imgs)
-    pix_vis = denormalize(pix_recon_imgs)
+    eps_map_vis = _noise_to_vis(pred_eps_img)
+    xprev_vis = denormalize(x_prev_img)
+    pix_vis = denormalize(pred_pix_img)
 
     titles = [
-        "Original",
-        f"Noisy Input\n(clean={model.clean_ratio}, t=500)",
-        "Eps-decoder Recon",
-        "Pix-decoder Recon",
+        "Original x_0",
+        f"Noisy x_t\n(clean={model.clean_ratio}, t=500)",
+        "Predicted ε̂",
+        "x_{t-1} (one DDPM step)",
+        "Pix-decoder output (x̂_0)",
     ]
     os.makedirs(save_dir, exist_ok=True)
     save_path = os.path.join(save_dir, f"vis_epoch_{epoch:04d}.png")
-    save_grid([clean_vis, noisy_vis, eps_vis, pix_vis], titles, save_path, nrow=n_samples)
+    save_grid([clean_vis, noisy_vis, eps_map_vis, xprev_vis, pix_vis],
+              titles, save_path, nrow=n_samples)
 
 
 @torch.no_grad()
@@ -163,6 +292,18 @@ def visualize_epoch(model, imgs, epoch, save_dir, device, n_samples=4):
     imgs = imgs[:n_samples].to(device)
     B = imgs.shape[0]
 
+    # Naive DDPM-ViT
+    if getattr(model, 'naive_ddpm', False):
+        _visualize_naive_ddpm(model, imgs, epoch, save_dir, device, n_samples)
+        model.train()
+        return
+
+    # Naive MAE
+    if getattr(model, 'naive_mae', False):
+        _visualize_naive_mae(model, imgs, epoch, save_dir, device, n_samples)
+        model.train()
+        return
+
     # Dual-decoder pretraining: visualize both noise-derived and pixel recons
     if getattr(model, 'dual_decoder', False):
         _visualize_dual(model, imgs, epoch, save_dir, device, n_samples)
@@ -196,56 +337,69 @@ def visualize_epoch(model, imgs, epoch, save_dir, device, n_samples=4):
     img_size = int(model.patch_size * (model.num_patches ** 0.5))
     mixed_imgs = model.unpatchify(mixed_patches, img_size=img_size)
 
-    # Encode + Decode
-    cls_token, patch_tokens = model.encoder(mixed_imgs)
-    pred = model.decoder(patch_tokens)
-
-    if getattr(model, 'predict_noise', False):
-        # Noise prediction mode: reconstruct by removing predicted noise
-        # x_0 = (x_t - sqrt(1-alpha_cumprod) * pred_noise) / sqrt(alpha_cumprod)
-        sqrt_alpha = model.diffusion.sqrt_alphas_cumprod[t][:, None, None]
-        sqrt_one_minus_alpha = model.diffusion.sqrt_one_minus_alphas_cumprod[t][:, None, None]
-        pred_patches = (mixed_patches - sqrt_one_minus_alpha * pred) / sqrt_alpha
+    # Encode + Decode (route on encoder type: DiT needs time conditioning)
+    if getattr(model, '_use_dit_encoder', False):
+        cls_token, patch_tokens = model._encode_with_indicators(mixed_imgs, noisy_mask, t)
     else:
-        pred_patches = pred
+        cls_token, patch_tokens = model.encoder(mixed_imgs)
+    pred = model.decoder(patch_tokens)
+    pred = model._apply_conv_refine(pred)
 
-    pred_imgs = model.unpatchify(pred_patches, img_size=img_size)
+    predict_noise = getattr(model, 'predict_noise', False)
 
     # Build mask visualization (highlight noisy patches)
-    mask_vis = torch.ones_like(imgs) * 0.3  # dim background
+    mask_vis = torch.ones_like(imgs) * 0.3
     p = model.patch_size
     h = w = img_size // p
     for b in range(B):
         for idx in range(model.num_patches):
             row, col = idx // w, idx % w
             if noisy_mask[b, idx]:
-                # Noisy patch: show in red tint
                 mask_vis[b, 0, row*p:(row+1)*p, col*p:(col+1)*p] = 0.8
                 mask_vis[b, 1, row*p:(row+1)*p, col*p:(col+1)*p] = 0.2
                 mask_vis[b, 2, row*p:(row+1)*p, col*p:(col+1)*p] = 0.2
             else:
-                # Clean patch: show in green tint
                 mask_vis[b, 0, row*p:(row+1)*p, col*p:(col+1)*p] = 0.2
                 mask_vis[b, 1, row*p:(row+1)*p, col*p:(col+1)*p] = 0.8
                 mask_vis[b, 2, row*p:(row+1)*p, col*p:(col+1)*p] = 0.2
 
-    # Denormalize for visualization
     clean_vis = denormalize(imgs)
     noisy_vis = denormalize(mixed_imgs)
-    recon_vis = denormalize(pred_imgs)
-
     t_str = f"t=[{t_min},{t_max}]"
-    titles = [
-        "Original",
-        f"Mask (red=noisy, green=clean)\nclean_ratio={clean_ratio:.2f}",
-        f"Noisy Input\n{t_str}",
-        "Reconstruction",
-    ]
+
+    if predict_noise:
+        # ε-prediction path: show ε̂ and one-step DDPM reverse (not lookahead).
+        x_prev_patches, _ = _ddpm_one_step_reverse(model, mixed_patches, pred, t)
+        x_prev_img = model.unpatchify(x_prev_patches, img_size=img_size)
+        pred_eps_img = model.unpatchify(pred, img_size=img_size)
+
+        eps_vis = _noise_to_vis(pred_eps_img)
+        xprev_vis = denormalize(x_prev_img)
+        titles = [
+            "Original",
+            f"Mask (red=noisy, green=clean)\nclean_ratio={clean_ratio:.2f}",
+            f"Noisy Input\n{t_str}",
+            "Predicted ε̂",
+            "x_{t-1} (one DDPM step)",
+        ]
+        save_grid([clean_vis, mask_vis, noisy_vis, eps_vis, xprev_vis],
+                  titles, os.path.join(save_dir, f"vis_epoch_{epoch:04d}.png"),
+                  nrow=n_samples)
+    else:
+        # pixel-reconstruction path: pred IS x_0 directly
+        pred_imgs = model.unpatchify(pred, img_size=img_size)
+        recon_vis = denormalize(pred_imgs)
+        titles = [
+            "Original",
+            f"Mask (red=noisy, green=clean)\nclean_ratio={clean_ratio:.2f}",
+            f"Noisy Input\n{t_str}",
+            "Pixel Reconstruction",
+        ]
+        save_grid([clean_vis, mask_vis, noisy_vis, recon_vis],
+                  titles, os.path.join(save_dir, f"vis_epoch_{epoch:04d}.png"),
+                  nrow=n_samples)
 
     os.makedirs(save_dir, exist_ok=True)
-    save_path = os.path.join(save_dir, f"vis_epoch_{epoch:04d}.png")
-    save_grid([clean_vis, mask_vis, noisy_vis, recon_vis], titles, save_path, nrow=n_samples)
-
     model.train()
 
 

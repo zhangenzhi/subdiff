@@ -1,0 +1,61 @@
+# Naive DDPM-ViT + Min-SNR-γ loss weighting (Hang et al. 2023)
+# Downweights the high-t regime where the model can only predict "mean"
+# (the mode-collapse attractor observed in dual_clean).
+# Used by SD3, PixArt-Σ, FLUX.
+
+data:
+  imagenet_dir: /lustre1/work/c30636/dataset/imagenet
+  image_size: 224
+  num_workers: 8
+
+model:
+  patch_size: 16
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  decoder_embed_dim: 512
+  decoder_depth: 4
+  decoder_num_heads: 8
+  naive_ddpm: true
+  qk_norm: true
+  dit_minimal_head: true
+
+diffusion:
+  num_timesteps: 1000
+  beta_start: 0.0001
+  beta_end: 0.02
+  schedule_type: linear
+  loss_weighting: min_snr    # NEW
+  snr_gamma: 5.0             # standard choice from Min-SNR paper
+
+curriculum:
+  t_min_start: 0
+  t_min_end: 0
+  t_max_start: 0
+  t_max_end: 0
+  clean_ratio_start: 0.0
+  clean_ratio_end: 0.0
+  warmup_epochs: 0
+  schedule: linear
+
+training:
+  epochs: 300
+  batch_size: 256
+  lr: 1.0e-4
+  min_lr: 1.0e-6
+  weight_decay: 0.0
+  warmup_epochs: 0
+  lr_schedule: constant
+  optimizer: adamw
+  clip_grad: 1.0
+
+probe:
+  eval_every: 20
+  probe_lr: 0.1
+  probe_epochs: 30
+  num_classes: 1000
+
+logging:
+  log_dir: ./logs_naive_ddpm_snr
+  save_every: 5
+  print_every: 100

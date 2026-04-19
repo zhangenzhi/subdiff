@@ -1,97 +1,85 @@
 # Open Questions and Next Steps
 
-## Priority 1 — Does the diffusion decoder actually use encoder conditioning?
+## DONE — Stability fixes (iterations 1-5)
 
-Central question for the generative-downstream story. Unclear from aggregate
-loss alone.
+See `stability.md` for full journey. Summary:
+- **QK-Norm** fixed attention entropy collapse (300+ epoch stability).
+- **Minimal final head** (zero-init Linear, replacing 4-layer Decoder) fixed
+  the "stable loss but pure-noise samples" problem — loss dropped from 0.34
+  plateau to 0.05-0.12 and sampling produces real image structure.
+- **DiTEncoder everywhere** (not just naive_ddpm) aligned SubDiff variants'
+  convergence speed with naive DDPM.
 
-### Proposed diagnostic: per-t loss bucketing
-Instrument `finetune_diffusion.py` to log loss separately for t in
-`[0, 200), [200, 500), [500, 800), [800, 1000)`. Predictions:
-- If pretrained encoder helps, the **high-t buckets drop faster** than scratch
-  (these are regimes where the noisy patch alone is uninformative).
-- If the decoder has learned a shortcut, all buckets look similar.
+Remaining stability tasks (low priority):
+- EMA weights (decay 0.9999) for inference quality — standard practice,
+  expected to improve FID but not critical for current training.
+- Logit-normal t sampling (SD3-style) instead of uniform — may help mid-t
+  learning efficiency.
 
-Cost: a few lines in the forward pass, and tensorboard writes.
+## Priority 1 — Verify the "pix head helps ε head" finding
 
-### Proposed ablation: strip encoder conditioning
-Add a flag that zeros out encoder features (or passes random vectors). If the
-loss curve stays the same, the decoder was already ignoring encoder.
+Epoch 0 data shows dual (DiT + clean anchor + ε + pix heads) has 17% lower
+ε loss than naive DDPM with identical architecture. This is the only
+finding where SubDiff's design helps the pretraining task itself (not just
+downstream). Needs rigorous validation:
 
-### Architectural intervention if needed
-- Encoder feature dropout during training (force decoder to tolerate missing
-  conditioning, which paradoxically makes it *rely* on the conditioning
-  signal when available).
-- Weight loss by `t` so high-t bins matter more (where conditioning is
-  irreplaceable).
-- Classifier-free guidance: randomly drop encoder conditioning with 10%
-  probability, which doubles as stronger utilization forcing.
+### 1a. Persistence across training
+Keep running all three runs (naive, eps, dual) to epoch 30/50/100 and
+compare ε loss at matching epochs. If dual's advantage disappears by epoch
+50, the finding is noise, not signal.
 
-## Priority 2 — Confirm dual-decoder actually learns both objectives
+### 1b. Reproducibility across seeds
+Current data is from a single seed per run. Re-run naive and dual with 2-3
+additional seeds. Expected seed-to-seed variance < 5%; if the 17% gap holds
+across seeds, it's real.
 
-Need to verify that the shared encoder is not collapsing to just one pathway.
+### 1c. Compute-matched comparison
+Dual does ~20% more compute per step (two heads + two loss terms). For a
+fair comparison at equal compute budget, either:
+- Train dual for proportionally fewer epochs.
+- Or normalize by wall-clock rather than epoch count.
 
-### Diagnostics to add
-- Log `L_eps` and `L_pix` separately (already done via `noisy_loss` and
-  `clean_loss` fields).
-- Compute gradient norm per decoder and per encoder block. If one decoder's
-  gradients dominate, the other is not really training.
-- Reconstruction visualizations side-by-side (already added in `_visualize_dual`).
+### 1d. Downstream diffusion finetune
+If the ε advantage in pretraining is real, initializing a diffusion
+finetune from dual should converge faster than initializing from naive.
+Direct test of "dual pretraining accelerates diffusion training."
 
-### If one pathway dominates
-Adjust `pixel_loss_weight`. Current default is 1.0; might need to tune to 0.5
-or 2.0.
+## Priority 2 — Generation quality evaluation
 
-## Priority 3 — x_0-prediction variant of pixel decoder
+Once one of the stable runs has trained long enough (50-100 epochs):
 
-From framework.md section "parameterization equivalences":
+1. Multi-step DDIM/DDPM sampling (5000 samples, ~2K+ needed for FID)
+2. FID against 5000-image ImageNet val reference (already prepared in
+   `fid_reference/`)
+3. Compare: naive_ddpm_minimal vs eps_dit vs dual_dit
+4. Visual comparison of 16-sample grids (current sampling at epoch 5 shows
+   patch-level structure, should become more coherent at epoch 50+)
 
-Make `decoder_pix` condition on `t` and predict x_0 (clean pixels adjusted for
-the timestep). This brings both heads firmly into the diffusion family, with
-epsilon-pred and x0-pred being complementary parameterizations.
+Target: honest baseline FID numbers. Expectations are modest — pixel-space
+ViT-B without class conditioning or EMA is not going to hit SOTA; a number
+in the 50-100 range is reasonable. The question is **relative** differences
+between the three runs.
 
-Implementation:
-- Add a simple time embedding MLP to `Decoder` (optional input).
-- In `_forward_dual`, pass `t` to `decoder_pix`.
-- Downstream: can sample from either parameterization, can even ensemble them.
+## Priority 3 — Downstream classification (reconfirm with new setup)
 
-## Priority 4 — Curriculum-less training vs curriculum training
+Old Run 1 (pixel-recon pretrain) gave +11% top1 on cls finetune.
+With the new architecture (DiTEncoder + minimal head), re-run cls finetune
+on:
+- naive_ddpm_minimal (pure ε pretrain, no clean anchor) — should be weaker.
+- eps_dit (clean anchor, single ε head) — should be mid.
+- dual_dit (clean anchor, ε + pix heads) — should be strongest (replicates
+  old Run 1 observation with cleaner architecture).
 
-Run 2 showed that epsilon prediction with curriculum has weird loss dynamics.
-The dual-decoder run uses no curriculum (full-range t). Worth a direct A/B:
-same dual-decoder design, one with curriculum-restricted t, one with full
-range, compare downstream performance.
+If dual > eps > naive on cls finetune top1, we have a clean multi-point
+ordering showing the value of each component.
 
-## Priority 5 — MAE-masking + clean anchors + dual decoder
+## Priority 4 — Diffusion-specific eval & ablation
 
-The natural combination of everything: some patches masked (no info), some
-clean (anchors), rest noisy (main signal). Three-way split:
-- ~25% masked
-- ~25% clean anchor
-- ~50% noisy
-Both decoders (eps, pix) predict for the masked + noisy portions. Tests
-whether harsher corruption plus anchors plus dual targets pushes the encoder
-to a stronger representation.
-
-Implementation: extend the 2-way split in `_forward_dual` to a 3-way split.
-Encoder uses `forward_masked` (MAE-efficient) with the 25% masked portion.
-
-## Priority 6 — Longer/larger scale
-
-All current runs are 300-epoch pretraining on ImageNet-1K, limited by the
-16-hour walltime (requires one resume). For a publishable result we would
-want:
-- 800 epochs (MAE-standard) for fair comparison to prior work.
-- linear probe numbers (not just finetune), which is the standard benchmark.
-- ImageNet-22K pretraining (if data is available) for scale comparison.
-
-## Priority 7 — Comparison baselines to include in any writeup
-
-- MAE (pure pixel reconstruction, 75% mask) reimplemented on same codebase.
-- MaskDiT (masked diffusion) on same codebase.
-- DINO or iBOT using a public checkpoint, then our downstream diffusion
-  finetune pipeline, to check if DINO features really do accelerate
-  generation (the original motivation from RAE-style papers).
+If dual pretraining accelerates diffusion finetune (Priority 1d confirmed):
+- Ablate the indicator embeddings (do they help? or is it only the pix
+  head that matters?).
+- Ablate clean_ratio (does 25% matter, or is any anchor fraction OK?).
+- Test varying pixel_loss_weight.
 
 ## Lower priority / parking lot
 
@@ -99,3 +87,19 @@ want:
 - Cross-attention visualization in the downstream diffusion decoder.
 - Different encoder scales (ViT-S, ViT-L) to check how the story scales.
 - Continuous noise schedule (flow matching or rectified flow) instead of DDPM.
+- MAE-masking + clean anchors + dual decoder: three-way patch split
+  (masked + clean + noisy) with MAE efficiency. Requires non-trivial code
+  refactor; only worth doing if Priority 1 finding holds.
+
+## Parking lot (older items, most subsumed by current priorities)
+
+- Per-t loss bucketing to see whether pretraining helps specific t regions —
+  useful if Priority 1d shows downstream diffusion speedup, to localize where
+  the benefit comes from.
+- x₀-prediction variant of pixel head (decoder_pix conditioned on t) — would
+  unify the dual-decoder into two diffusion parameterizations.
+- MAE-masking + clean anchors + dual decoder (3-way patch split). Worth
+  revisiting only if Priority 1 finding is confirmed.
+- 800-epoch pretraining on ImageNet-22K for publication-grade numbers.
+- Compare against external baselines: MAE (reimplemented), MaskDiT, DINO
+  checkpoints — needed for writeup.

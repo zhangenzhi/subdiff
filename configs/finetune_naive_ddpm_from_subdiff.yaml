@@ -1,0 +1,71 @@
+# Convert a SubDiff pretrained checkpoint into a naive DDPM-ViT generation
+# model by adding time conditioning and finetuning briefly.
+#
+# Usage:
+#   torchrun --nproc_per_node=4 scripts/pretrain.py \
+#       --config configs/finetune_naive_ddpm_from_subdiff.yaml \
+#       --init_from logs_dual/checkpoints/checkpoint_best.pth
+#
+# What gets loaded: encoder weights (patch_embed, blocks, norm, cls_token,
+# pos_embed) and decoder weights. What stays random: time_embed (new module
+# not present in the source SubDiff checkpoint).
+#
+# After this finishes, sample with:
+#   python scripts/sample_naive_ddpm.py \
+#       --config configs/finetune_naive_ddpm_from_subdiff.yaml \
+#       --checkpoint logs_naive_ddpm_from_subdiff/checkpoints/checkpoint_best.pth \
+#       --num_samples 5000 --output_dir samples_subdiff_to_ddpm/
+
+data:
+  imagenet_dir: /lustre1/work/c30636/dataset/imagenet
+  image_size: 224
+  num_workers: 8
+
+model:
+  patch_size: 16
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  decoder_embed_dim: 512
+  decoder_depth: 4
+  decoder_num_heads: 8
+  naive_ddpm: true
+
+diffusion:
+  num_timesteps: 1000
+  beta_start: 0.0001
+  beta_end: 0.02
+  schedule_type: linear
+
+curriculum:
+  t_min_start: 0
+  t_min_end: 0
+  t_max_start: 0
+  t_max_end: 0
+  clean_ratio_start: 0.0
+  clean_ratio_end: 0.0
+  warmup_epochs: 0
+  schedule: linear
+
+# Shorter run + lower lr because encoder/decoder are pretrained.
+# Time embedding is fresh and needs to learn quickly.
+training:
+  epochs: 50
+  batch_size: 256
+  lr: 5.0e-5            # lower than from-scratch (1e-4)
+  min_lr: 1.0e-6
+  weight_decay: 0.05
+  warmup_epochs: 5      # short warmup
+  optimizer: adamw
+  clip_grad: 1.0
+
+probe:
+  eval_every: 20
+  probe_lr: 0.1
+  probe_epochs: 30
+  num_classes: 1000
+
+logging:
+  log_dir: ./logs_naive_ddpm_from_subdiff
+  save_every: 5
+  print_every: 100
