@@ -146,6 +146,71 @@ def _visualize_naive_ddpm(model, imgs, epoch, save_dir, device, n_samples=4):
 
 
 @torch.no_grad()
+def _visualize_naive_rf(model, imgs, epoch, save_dir, device, n_samples=4):
+    """Rectified Flow (SD3/FLUX) viz — model predicts v = ε − x_0.
+
+    RF path: x_t = (1−t)·x_0 + t·ε with t ∈ (0, 1).
+    Algebraic decomposition of v̂ (no sampler iterations needed):
+      x̂_0 = x_t − t·v̂        (clean lookahead, also the single Euler step to t=0)
+      ε̂   = x_t + (1−t)·v̂    (noise recovery)
+
+    Columns:
+      1. Original x_0
+      2. Noisy x_t (t=0.5 — half signal, half noise)
+      3. Predicted v̂ (as mean-centered map; v ~ N(0, 2) per pixel a priori)
+      4. Recovered ε̂
+      5. x̂_0 (lookahead; equivalently one Euler step all the way to t=0)
+
+    Note: for RF+MAE (Run 10), this runs at r=0 (no mask) — the inference
+    distribution, matching the r≈0 tail of training.
+    """
+    B = imgs.shape[0]
+    img_size = int(model.patch_size * (model.num_patches ** 0.5))
+
+    # Fixed vis-time t=0.5: middle of the RF path (signal and noise ~equal weight).
+    t_cont = torch.full((B,), 0.5, device=device)
+    t_b = t_cont.view(B, 1, 1)
+
+    target_patches = model.patchify(imgs)
+    eps = torch.randn_like(target_patches)
+    x_t_patches = (1 - t_b) * target_patches + t_b * eps
+    x_t_imgs = model.unpatchify(x_t_patches, img_size=img_size)
+
+    # Model forward (integer t for sinusoidal embed, consistent with training path)
+    t_int = (t_cont * (model.diffusion.num_timesteps - 1)).long()
+    cls_token, patch_tokens = model._encode_with_time(x_t_imgs, t_int)
+    pred_v_patches = model.decoder(patch_tokens)
+    pred_v_patches = model._apply_conv_refine(pred_v_patches)
+
+    # Algebraic decomposition (no sampler)
+    pred_x0_patches = x_t_patches - t_b * pred_v_patches
+    pred_eps_patches = x_t_patches + (1 - t_b) * pred_v_patches
+
+    v_img = model.unpatchify(pred_v_patches, img_size=img_size)
+    eps_img = model.unpatchify(pred_eps_patches, img_size=img_size)
+    x0_img = model.unpatchify(pred_x0_patches, img_size=img_size)
+
+    clean_vis = denormalize(imgs)
+    noisy_vis = denormalize(x_t_imgs)
+    # v has ~√2 std, scale slightly tighter than ε̂
+    v_vis = (v_img * 0.2 + 0.5).clamp(0, 1)
+    eps_vis = _noise_to_vis(eps_img)
+    x0_vis = denormalize(x0_img)
+
+    titles = [
+        "Original x_0",
+        "Noisy x_t (t=0.5)",
+        "Predicted v̂",
+        "Recovered ε̂",
+        "x̂_0 (Euler → t=0)",
+    ]
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f"vis_epoch_{epoch:04d}.png")
+    save_grid([clean_vis, noisy_vis, v_vis, eps_vis, x0_vis],
+              titles, save_path, nrow=n_samples)
+
+
+@torch.no_grad()
 def _visualize_naive_mae(model, imgs, epoch, save_dir, device, n_samples=4):
     """Naive MAE viz: Original | Masked Input | Reconstruction."""
     B = imgs.shape[0]
@@ -292,7 +357,14 @@ def visualize_epoch(model, imgs, epoch, save_dir, device, n_samples=4):
     imgs = imgs[:n_samples].to(device)
     B = imgs.shape[0]
 
-    # Naive DDPM-ViT
+    # Rectified Flow (v-pred) — check BEFORE naive_ddpm because RF+MAE has
+    # both flags set (naive_ddpm=True, flow_matching=True)
+    if getattr(model, 'flow_matching', False):
+        _visualize_naive_rf(model, imgs, epoch, save_dir, device, n_samples)
+        model.train()
+        return
+
+    # Naive DDPM-ViT (ε-pred)
     if getattr(model, 'naive_ddpm', False):
         _visualize_naive_ddpm(model, imgs, epoch, save_dir, device, n_samples)
         model.train()
