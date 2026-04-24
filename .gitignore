@@ -16,6 +16,7 @@ core-python.*
 # Generated outputs and evaluation data
 samples_*/
 fid_reference/
+fid_reference_*/
 
 # IDE
 .vscode/
