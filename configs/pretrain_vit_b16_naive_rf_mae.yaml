@@ -1,0 +1,90 @@
+# RF + MAE mask (v-pred), MaskDiT-style mask-token replacement.
+#
+# Motivation: naive RF at 224×16 produces "impressionistic tiles" — each
+# patch is reasonable on its own but cross-patch coherence is weak.
+# MaskDiT shows that replacing a fraction of patch tokens with a learned
+# mask_token BEFORE the encoder forces attention to reconstruct them from
+# context, which adds global coherence.
+#
+# Differences from classic MAE:
+#   - Symmetric: ALL 196 tokens go through the DiTEncoder (we already use
+#     a minimal per-token Linear head, so asymmetric doesn't buy us much).
+#   - Mask ratio r ~ U(0, rf_mae_max_mask) per step, including r ≈ 0 so
+#     training still covers the clean-input distribution used at sampling.
+#   - v-prediction loss on all tokens: L_visible (primary) + λ · L_masked.
+#
+# Expected outcome vs naive RF:
+#   - MORE coherent: attention learns cross-patch priors, so object contours
+#     should emerge instead of tile-level textures.
+#   - STILL blurry at pixel level: v-prediction can't produce fine detail
+#     without a VAE; we're trading sharpness for structure.
+#
+# Sampling: use scripts/sample_flow.py with no mask (r=0 at inference,
+# which matches the r≈0 tail of training distribution).
+
+data:
+  imagenet_dir: /lustre1/work/c30636/dataset/imagenet
+  image_size: 224
+  num_workers: 8
+  transform_type: diffusion
+
+model:
+  patch_size: 16
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  decoder_embed_dim: 512    # unused with dit_minimal_head
+  decoder_depth: 4
+  decoder_num_heads: 8
+  naive_ddpm: true
+  qk_norm: true
+  dit_minimal_head: true
+  pos_embed_type: sincos
+
+diffusion:
+  num_timesteps: 1000       # used only for time_embed scalar scaling
+  beta_start: 0.0001
+  beta_end: 0.02
+  schedule_type: linear
+  flow_matching: true       # activate Rectified Flow path
+  rf_t_sampling: logit_normal
+  rf_logit_mean: 0.0        # SD3 default (μ = 0)
+  rf_logit_std: 1.0
+  loss_weighting: simple
+
+  # RF + MAE mask (MaskDiT-style)
+  rf_mae_enabled: true
+  rf_mae_max_mask: 0.5      # per-step r ~ U(0, 0.5); 25% expected mask rate
+  mae_aux_weight: 0.1       # L = L_visible + 0.1 * L_masked
+
+curriculum:
+  t_min_start: 0
+  t_min_end: 0
+  t_max_start: 0
+  t_max_end: 0
+  clean_ratio_start: 0.0
+  clean_ratio_end: 0.0
+  warmup_epochs: 0
+  schedule: linear
+
+training:
+  epochs: 300
+  batch_size: 256
+  lr: 1.0e-4
+  min_lr: 1.0e-6
+  weight_decay: 0.0
+  warmup_epochs: 0
+  lr_schedule: constant
+  optimizer: adamw
+  clip_grad: 1.0
+
+probe:
+  eval_every: 20
+  probe_lr: 0.1
+  probe_epochs: 30
+  num_classes: 1000
+
+logging:
+  log_dir: ./logs_naive_rf_mae
+  save_every: 5
+  print_every: 100

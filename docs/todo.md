@@ -9,12 +9,38 @@ See `stability.md` for full journey. Summary:
   plateau to 0.05-0.12 and sampling produces real image structure.
 - **DiTEncoder everywhere** (not just naive_ddpm) aligned SubDiff variants'
   convergence speed with naive DDPM.
+- **patch_size=2 at 32×32** (Run 8) confirmed that patch size is the
+  core bottleneck for pixel-space ViT diffusion at 224×16.
+- **Rectified Flow path** (Run 9) implemented and trained: v-pred + logit-
+  normal t. Trains stably but does not fix the tiled-patch failure at 224×16.
+- **Logit-normal t sampling** (SD3-style) — shipped as part of the RF path;
+  also available via `rf_t_sampling` flag.
 
 Remaining stability tasks (low priority):
 - EMA weights (decay 0.9999) for inference quality — standard practice,
   expected to improve FID but not critical for current training.
-- Logit-normal t sampling (SD3-style) instead of uniform — may help mid-t
-  learning efficiency.
+
+## Priority 0 — Run RF + MAE mask (Run 10, ready to launch)
+
+Implemented but not yet trained. Config: `pretrain_vit_b16_naive_rf_mae.yaml`.
+Launch with:
+```
+torchrun --nproc_per_node=4 scripts/pretrain.py \
+  --config configs/pretrain_vit_b16_naive_rf_mae.yaml
+```
+Key checks:
+- Epoch-0 visible loss should be comparable to Run 9 (naive RF) — if much
+  higher, mask_token is disrupting training; retune `rf_mae_max_mask`.
+- Sampling with `scripts/sample_flow.py` at epoch 5-10: look for emergent
+  object contours vs Run 9's "impressionistic tiles."
+- If coherence improves but pixel sharpness drops, the trade-off is
+  as expected. Next step: combine with Conv-refine head.
+
+Exit criteria:
+- If contours are clearly better than naive RF → this is the new best
+  pixel-space 224×16 recipe; push toward FID evaluation.
+- If no visible improvement → mask ratio / aux weight sweep, or conclude
+  that pixel-space 224×16 needs a structured head instead.
 
 ## Priority 1 — Verify the "pix head helps ε head" finding
 

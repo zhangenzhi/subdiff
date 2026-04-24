@@ -295,6 +295,53 @@ For stable ε-prediction on ViT in pixel space (unconditional, ImageNet):
   - DDIM (η=0) or DDPM ancestral (η=1), stride allowed
   - Use `alpha_bar[ts[i+1]]` for strided DDIM (not `alpha_bar[t-1]`)
 
+## Failure mode 5: "tiled mean patch" at 224×16 — a head problem, not a loss problem
+
+### Observation
+
+With the stable recipe (DiTEncoder + QK-Norm + minimal Linear head), naive
+DDPM at 224×16 trains cleanly and produces samples with per-patch texture —
+but no object-level coherence. Each 16×16 tile looks plausibly natural on
+its own; their composition is visually incompatible, like a photomosaic of
+unrelated fragments.
+
+### Test 1: patch-size ablation (Run 8)
+
+Resized ImageNet to 32×32, used patch_size=2 (still 256 tokens, same
+backbone, same training recipe). Samples: **recognizable object silhouettes
+and textures, not tiles**. Same model, same loss, same optimizer — the
+only change is the output resolution per token.
+
+**Diagnosis**: the per-token Linear head maps `embed_dim=768` → `patch_dim`.
+At patch_size=16 (patch_dim=768), each token independently predicts 256
+RGB values with no spatial structure in the head itself. Cross-patch
+attention can only bias what each token predicts *as a whole*, not how
+pixels arrange *within* a token's output. Latent DiT sidesteps this by
+having a VAE decoder provide intra-patch structure; in pixel space we pay
+the full cost.
+
+### Test 2: change the loss target (Run 9, naive RF)
+
+Replaced DDPM ε-pred with Rectified Flow v-pred + logit-normal t + linear
+interpolation path (SD3/FLUX ingredients). Loss trains stably. Samples:
+**same "impressionistic tiles" as naive DDPM**. v-prediction changes the
+loss landscape and the noise→data path, but not the per-token head.
+
+**Conclusion**: the 224×16 tiled failure is architectural (head-level),
+not objective-level. Changing ε→v cannot fix it.
+
+### Next attempt: RF + MAE mask (Run 10, implemented, not yet launched)
+
+MaskDiT-style mask-token replacement before the encoder. Rationale: force
+the encoder/attention to infer masked tokens purely from context, growing
+cross-patch priors. Symmetric (all tokens flow through the encoder); mask
+ratio r ~ U(0, 0.5) per step so training covers r=0 (the sampling
+distribution). Loss: `L_visible + 0.1 · L_masked` on v.
+
+Expectation: more structural coherence at the cost of per-patch
+sharpness. If this helps, the natural follow-up is Conv-refine head to
+recover some sharpness.
+
 ## Open questions
 
 1. Is the dual finding real and reproducible? (priority 1, see todo.md)
@@ -302,5 +349,8 @@ For stable ε-prediction on ViT in pixel space (unconditional, ImageNet):
    as pretraining for a longer diffusion finetune?
 3. Does the pix head's positive contribution to ε learning persist throughout
    training, or is it only early?
-4. If we use continuous time instead of discrete (as in flow matching / EDM),
-   does the dual advantage grow or shrink?
+4. **Does RF + MAE mask produce object-level coherence at 224×16?** (Run 10,
+   implemented). If yes, this is the first architectural fix for the tiled
+   failure that doesn't require leaving pixel space.
+5. If RF + MAE still fails, is the right next step a structured head
+   (Conv refine / UNet-style decoder) or abandoning 224×16 for latent DiT?

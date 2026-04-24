@@ -146,13 +146,23 @@ def main():
         rf_t_sampling=cfg.get('diffusion', {}).get('rf_t_sampling', 'logit_normal'),
         rf_logit_mean=cfg.get('diffusion', {}).get('rf_logit_mean', 0.0),
         rf_logit_std=cfg.get('diffusion', {}).get('rf_logit_std', 1.0),
+        rf_mae_enabled=cfg.get('diffusion', {}).get('rf_mae_enabled', False),
+        rf_mae_max_mask=cfg.get('diffusion', {}).get('rf_mae_max_mask', 0.5),
+        mae_aux_weight=cfg.get('diffusion', {}).get('mae_aux_weight', 0.1),
     ).to(device)
 
     if is_main:
         param_count = sum(p.numel() for p in model.parameters()) / 1e6
         if model.naive_ddpm:
             head_type = "minimal head" if model.dit_minimal_head else "4-layer decoder"
-            obj = "RF v-pred" if model.flow_matching else "DDPM eps-pred"
+            if model.flow_matching:
+                if model.rf_mae_enabled:
+                    obj = (f"RF v-pred + MAE mask "
+                           f"(r≤{model.rf_mae_max_mask}, aux={model.mae_aux_weight})")
+                else:
+                    obj = "RF v-pred"
+            else:
+                obj = "DDPM eps-pred"
             mode = f"naive-ViT ({obj}, {head_type})"
         elif model.naive_mae:
             mode = f"naive MAE (mask={model.mask_ratio})"
