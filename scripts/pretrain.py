@@ -142,13 +142,18 @@ def main():
         loss_weighting=cfg.get('diffusion', {}).get('loss_weighting', 'simple'),
         snr_gamma=cfg.get('diffusion', {}).get('snr_gamma', 5.0),
         pos_embed_type=cfg.get('model', {}).get('pos_embed_type', 'sincos'),
+        flow_matching=cfg.get('diffusion', {}).get('flow_matching', False),
+        rf_t_sampling=cfg.get('diffusion', {}).get('rf_t_sampling', 'logit_normal'),
+        rf_logit_mean=cfg.get('diffusion', {}).get('rf_logit_mean', 0.0),
+        rf_logit_std=cfg.get('diffusion', {}).get('rf_logit_std', 1.0),
     ).to(device)
 
     if is_main:
         param_count = sum(p.numel() for p in model.parameters()) / 1e6
         if model.naive_ddpm:
             head_type = "minimal head" if model.dit_minimal_head else "4-layer decoder"
-            mode = f"naive DDPM-ViT (eps prediction, {head_type})"
+            obj = "RF v-pred" if model.flow_matching else "DDPM eps-pred"
+            mode = f"naive-ViT ({obj}, {head_type})"
         elif model.naive_mae:
             mode = f"naive MAE (mask={model.mask_ratio})"
         elif model.dual_decoder:

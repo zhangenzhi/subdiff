@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from .vit import ViTEncoder, DiTEncoder, Decoder
-from .diffusion import PatchDiffusion
+from .diffusion import PatchDiffusion, RectifiedFlow
 from .curriculum import CurriculumScheduler
 
 
@@ -71,7 +71,11 @@ class SubDiff(nn.Module):
                  use_indicators=False,
                  use_conv_refine=False,
                  loss_weighting='simple', snr_gamma=5.0,
-                 pos_embed_type='sincos'):
+                 pos_embed_type='sincos',
+                 flow_matching=False, rf_t_sampling='logit_normal',
+                 rf_logit_mean=0.0, rf_logit_std=1.0,
+                 rf_mae_enabled=False, rf_mae_max_mask=0.5,
+                 mae_aux_weight=0.1):
         super().__init__()
 
         self.patch_size = patch_size
@@ -142,6 +146,18 @@ class SubDiff(nn.Module):
             beta_end=beta_end, schedule_type=schedule_type
         )
 
+        # Optional Rectified Flow (SD3 / FLUX style). When enabled, replaces
+        # the DDPM forward path with linear interpolation and v-prediction.
+        self.flow_matching = flow_matching
+        if flow_matching:
+            self.rf = RectifiedFlow(
+                t_sampling=rf_t_sampling,
+                logit_mean=rf_logit_mean,
+                logit_std=rf_logit_std,
+            )
+        else:
+            self.rf = None
+
         # Curriculum
         if curriculum_cfg is None:
             curriculum_cfg = {}
@@ -198,6 +214,21 @@ class SubDiff(nn.Module):
         self.pixel_loss_weight = pixel_loss_weight
         self.naive_mae = naive_mae
         self.naive_ddpm = naive_ddpm
+
+        # RF + MAE mask (MaskDiT-style): replace a fraction of patch tokens
+        # with a learnable mask_token embedding before the encoder, forcing
+        # cross-patch reasoning. All tokens go through encoder (no asymmetric
+        # encoder-decoder); target is still v on all tokens.
+        self.rf_mae_enabled = rf_mae_enabled
+        self.rf_mae_max_mask = rf_mae_max_mask
+        self.mae_aux_weight = mae_aux_weight
+        if rf_mae_enabled:
+            assert flow_matching and naive_ddpm, \
+                "rf_mae_enabled requires flow_matching=True and naive_ddpm=True"
+            self.rf_mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+            nn.init.trunc_normal_(self.rf_mask_token, std=0.02)
+        else:
+            self.rf_mask_token = None
 
         # Time embedding: used by naive_ddpm (adaLN per block) and by
         # SubDiff eps-prediction paths (additive to patch tokens).
@@ -323,6 +354,10 @@ class SubDiff(nn.Module):
             loss: reconstruction loss
             log_dict: dict with metrics for logging
         """
+        if self.flow_matching and self.naive_ddpm:
+            if self.rf_mae_enabled:
+                return self._forward_naive_rf_mae(imgs, epoch)
+            return self._forward_naive_rf(imgs, epoch)
         if self.naive_ddpm:
             return self._forward_naive_ddpm(imgs, epoch)
         if self.naive_mae:
@@ -457,6 +492,125 @@ class SubDiff(nn.Module):
         """
         time_emb = self.time_embed(t)  # (B, D)
         return self.encoder(noisy_imgs, time_emb)
+
+    def _forward_naive_rf(self, imgs, epoch=0):
+        """Naive Rectified Flow on ViT (SD3 / FLUX style, unconditional).
+
+        - t ~ logit-normal (or uniform) in (0, 1)
+        - x_t = (1-t)*x_0 + t*ε (linear interpolation)
+        - Model predicts v = ε − x_0 (velocity)
+        - Loss: MSE(v̂, v) (flow matching loss)
+        - NOTE: we feed t × (num_timesteps-1) into the sinusoidal time_embed
+          so the scalar passed to the encoder spans the same range as DDPM.
+        """
+        B = imgs.shape[0]
+        device = imgs.device
+        img_size = int(self.patch_size * (self.num_patches ** 0.5))
+
+        target_patches = self.patchify(imgs)                       # (B, N, patch_dim)
+        t = self.rf.sample_t(B, device)                            # (B,) in (0, 1)
+        x_t_patches, v, eps = self.rf.add_noise(target_patches, t)
+        x_t_imgs = self.unpatchify(x_t_patches, img_size=img_size)
+
+        # Time embedding: scale t ∈ (0,1) to the integer range used by sinusoidal
+        t_int = (t * (self.diffusion.num_timesteps - 1)).long()
+        cls_token, patch_tokens = self._encode_with_time(x_t_imgs, t_int)
+
+        pred_v = self.decoder(patch_tokens)                         # (B, N, patch_dim)
+        pred_v = self._apply_conv_refine(pred_v)
+
+        # Flow matching loss (simple MSE, no extra weighting needed when using
+        # logit-normal t sampling — the sampler already emphasizes informative t).
+        loss = F.mse_loss(pred_v, v)
+
+        log_dict = {
+            'loss': loss.detach(),
+            'noisy_loss': loss.detach(),
+            'clean_loss': torch.tensor(0.0, device=device),
+            't_min': 0,
+            't_max': self.diffusion.num_timesteps,
+            'clean_ratio': 0.0,
+            't_mean': t.mean().detach(),
+        }
+        return loss, log_dict
+
+    def _forward_naive_rf_mae(self, imgs, epoch=0):
+        """RF + MaskDiT-style mask replacement + v-prediction.
+
+        Motivation: naive RF at 224×16 produces impressionistic tiles because
+        each patch is predicted largely independently. Replacing a random
+        fraction of patch tokens with a learnable mask_token BEFORE the
+        encoder forces attention to reconstruct them from context, which
+        should add global coherence at the expense of per-patch sharpness.
+
+        Differences from classic MAE:
+          - Symmetric: all N tokens go through the DiTEncoder (no asymmetric
+            encoder-decoder). The minimal Linear head is per-token anyway.
+          - Mask ratio r ~ U(0, rf_mae_max_mask) per step, including r ≈ 0
+            so the model still sees the clean-input distribution used at
+            inference (no OOD gap during sampling).
+          - Loss on all tokens: L_visible (primary) + λ · L_masked (aux).
+        """
+        B = imgs.shape[0]
+        device = imgs.device
+        img_size = int(self.patch_size * (self.num_patches ** 0.5))
+        N = self.num_patches
+
+        # RF forward
+        target_patches = self.patchify(imgs)
+        t = self.rf.sample_t(B, device)
+        x_t_patches, v, eps = self.rf.add_noise(target_patches, t)
+        x_t_imgs = self.unpatchify(x_t_patches, img_size=img_size)
+
+        # Patch-embed (then we'll swap in mask_token on selected positions)
+        patch_tokens = self.encoder.patch_embed(x_t_imgs)  # (B, N, D)
+
+        # Per-step mask ratio r ~ U(0, rf_mae_max_mask). Same r for all samples
+        # in the batch; masked positions chosen independently per sample.
+        r = float(torch.empty((), device=device).uniform_(0.0, self.rf_mae_max_mask))
+        len_mask = int(round(N * r))
+
+        if len_mask > 0:
+            rand = torch.rand(B, N, device=device)
+            ids_shuffle = torch.argsort(rand, dim=1)
+            ids_mask = ids_shuffle[:, :len_mask]
+            mask = torch.zeros(B, N, device=device)
+            mask.scatter_(1, ids_mask, 1.0)        # 1 = masked, 0 = visible
+            m = mask.unsqueeze(-1)                  # (B, N, 1)
+            mask_token = self.rf_mask_token.expand(B, N, -1)
+            patch_tokens = patch_tokens * (1 - m) + mask_token * m
+        else:
+            mask = torch.zeros(B, N, device=device)
+
+        # Time conditioning through DiTEncoder (forward_patches applies
+        # cls_token + pos_embed + adaLN-Zero blocks)
+        t_int = (t * (self.diffusion.num_timesteps - 1)).long()
+        c = self.time_embed(t_int)
+        cls_token, enc_patch_tokens = self.encoder.forward_patches(patch_tokens, c)
+
+        pred_v = self.decoder(enc_patch_tokens)
+        pred_v = self._apply_conv_refine(pred_v)
+
+        visible_mask = (mask == 0)
+        masked_mask = (mask == 1)
+        vis_loss = self._masked_mse(pred_v, v, visible_mask)
+        if masked_mask.sum() > 0:
+            mask_loss = self._masked_mse(pred_v, v, masked_mask)
+        else:
+            mask_loss = torch.tensor(0.0, device=device)
+
+        loss = vis_loss + self.mae_aux_weight * mask_loss
+
+        log_dict = {
+            'loss': loss.detach(),
+            'noisy_loss': vis_loss.detach(),
+            'clean_loss': mask_loss.detach(),
+            't_min': 0,
+            't_max': self.diffusion.num_timesteps,
+            'clean_ratio': 1.0 - r,              # fraction of visible patches
+            't_mean': t.mean().detach(),
+        }
+        return loss, log_dict
 
     def _forward_naive_ddpm(self, imgs, epoch=0):
         """Naive DDPM-ViT pretraining (standard DDPM training on a ViT).

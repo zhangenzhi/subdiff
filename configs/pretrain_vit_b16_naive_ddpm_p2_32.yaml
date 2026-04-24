@@ -1,0 +1,69 @@
+# Naive DDPM-ViT at low resolution with small patches.
+# Purpose: isolate the "patch size" factor.
+#
+# Setup:
+#   - Resize ImageNet to 32×32 (CIFAR-like resolution)
+#   - patch_size=2  → num_patches = 16×16 = 256 tokens
+#   - Each patch is only 2×2×3 = 12 pixels (vs 768 at 224×16)
+#   - Adjacent patches cover neighboring pixels (strong spatial correlation)
+#
+# If this removes the tiled-output problem, patch size / patch-boundary
+# independence is a main cause of the pixel-space ViT generation failure.
+
+data:
+  imagenet_dir: /lustre1/work/c30636/dataset/imagenet
+  image_size: 32
+  num_workers: 8
+  transform_type: diffusion
+
+model:
+  patch_size: 2
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  decoder_embed_dim: 512    # unused with dit_minimal_head
+  decoder_depth: 4
+  decoder_num_heads: 8
+  naive_ddpm: true
+  qk_norm: true
+  dit_minimal_head: true
+  pos_embed_type: sincos
+
+diffusion:
+  num_timesteps: 1000
+  beta_start: 0.0001
+  beta_end: 0.02
+  schedule_type: linear
+  loss_weighting: simple     # keep simple to isolate patch-size effect
+
+curriculum:
+  t_min_start: 0
+  t_min_end: 0
+  t_max_start: 0
+  t_max_end: 0
+  clean_ratio_start: 0.0
+  clean_ratio_end: 0.0
+  warmup_epochs: 0
+  schedule: linear
+
+training:
+  epochs: 300
+  batch_size: 512           # can be larger since 32×32 is cheap
+  lr: 1.0e-4
+  min_lr: 1.0e-6
+  weight_decay: 0.0
+  warmup_epochs: 0
+  lr_schedule: constant
+  optimizer: adamw
+  clip_grad: 1.0
+
+probe:
+  eval_every: 20
+  probe_lr: 0.1
+  probe_epochs: 30
+  num_classes: 1000
+
+logging:
+  log_dir: ./logs_naive_ddpm_p2_32
+  save_every: 5
+  print_every: 100

@@ -1,11 +1,72 @@
 """
 Diffusion noise utilities for SubDiff pretraining.
 Handles forward diffusion (adding noise) at the patch level.
+
+Two families supported:
+- PatchDiffusion: DDPM forward process (x_t = sqrt(alpha_bar)*x_0 + sqrt(1-alpha_bar)*eps)
+- RectifiedFlow: SD3-style linear interpolation (x_t = (1-t)*x_0 + t*eps)
 """
 
 import math
 import torch
 import torch.nn as nn
+
+
+# ---------------------------------------------------------------------------
+# Rectified Flow (SD3 / FLUX style)
+# ---------------------------------------------------------------------------
+
+class RectifiedFlow(nn.Module):
+    """Linear interpolation path between data and noise.
+
+    Forward:  x_t = (1-t) * x_0 + t * eps,  t ∈ [0, 1]
+    Velocity: v   = dx_t / dt = eps - x_0
+
+    Compared to DDPM:
+    - Path is linear (constant velocity), no sqrt curvature
+    - Target v is a mixture of ε and x_0 (half-way on manifold)
+    - Sampling is straightforward ODE integration
+    """
+
+    def __init__(self, t_sampling='logit_normal', logit_mean=0.0, logit_std=1.0):
+        super().__init__()
+        self.t_sampling = t_sampling
+        self.logit_mean = logit_mean
+        self.logit_std = logit_std
+
+    def sample_t(self, batch_size, device):
+        """Sample t ∈ (0, 1) per sample.
+        - 'uniform': t ~ U(0, 1)
+        - 'logit_normal' (SD3): u ~ N(mean, std^2); t = sigmoid(u)
+          Concentrates samples around the middle-t regime where structure forms.
+        """
+        if self.t_sampling == 'uniform':
+            t = torch.rand(batch_size, device=device)
+        else:  # logit_normal
+            u = torch.randn(batch_size, device=device) * self.logit_std + self.logit_mean
+            t = torch.sigmoid(u)
+        return t.clamp(min=1e-5, max=1.0 - 1e-5)
+
+    def add_noise(self, x_0, t, eps=None):
+        """x_t = (1-t) * x_0 + t * eps. Returns (x_t, v, eps) where v = eps - x_0.
+
+        Args:
+            x_0: (B, ...) clean samples
+            t: (B,) in (0, 1)
+        """
+        if eps is None:
+            eps = torch.randn_like(x_0)
+        # Broadcast t to x_0's shape
+        shape = [t.shape[0]] + [1] * (x_0.dim() - 1)
+        t_b = t.view(*shape)
+        x_t = (1 - t_b) * x_0 + t_b * eps
+        v = eps - x_0
+        return x_t, v, eps
+
+
+# ---------------------------------------------------------------------------
+# DDPM (original)
+# ---------------------------------------------------------------------------
 
 
 def linear_beta_schedule(num_timesteps, beta_start=0.0001, beta_end=0.02):
