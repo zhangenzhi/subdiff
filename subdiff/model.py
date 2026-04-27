@@ -354,6 +354,8 @@ class SubDiff(nn.Module):
             loss: reconstruction loss
             log_dict: dict with metrics for logging
         """
+        if self.flow_matching and self.dual_decoder:
+            return self._forward_dual_rf(imgs, epoch)
         if self.flow_matching and self.naive_ddpm:
             if self.rf_mae_enabled:
                 return self._forward_naive_rf_mae(imgs, epoch)
@@ -754,6 +756,76 @@ class SubDiff(nn.Module):
             't_max': t_max,
             'clean_ratio': self.clean_ratio,
             't_mean': t.float().mean().detach(),
+        }
+        return loss, log_dict
+
+    def _forward_dual_rf(self, imgs, epoch=0):
+        """Dual-head RF with clean prompt patches (inpaint / prompt-to-image).
+
+        Design (positioned as image-completion, not unconditional generation):
+          - Input = clean_ratio · clean + (1 − clean_ratio) · RF-noised
+              clean patches act as a "prompt" — context the encoder reads to
+              fill in the noised positions. Inference takes a real image as
+              prompt and generates the rest.
+          - Shared encoder with clean/noisy indicators + time conditioning
+          - decoder      → predicts v = ε − x_0 on noisy patches  (RF, high-freq)
+          - decoder_pix  → predicts x_0 on noisy patches            (MAE, global)
+          - Loss on noisy patches only (clean ones are trivial for both heads)
+          - Combined: L = L_v + pixel_loss_weight · L_x0
+
+        Note on Run 7: the same architecture with DDPM ε-target had mode
+        collapse at unconditional sampling (no clean anchors at inference).
+        We sidestep that here by **requiring clean prompts at inference**;
+        train and test share the same input distribution.
+        """
+        B = imgs.shape[0]
+        device = imgs.device
+        img_size = int(self.patch_size * (self.num_patches ** 0.5))
+
+        target_patches = self.patchify(imgs)  # (B, N, patch_dim)
+
+        # RF time sample (continuous in (0,1))
+        t = self.rf.sample_t(B, device)
+
+        # 25%/75% clean/noisy split
+        noisy_mask = self.diffusion.generate_noisy_mask(
+            B, self.num_patches, self.clean_ratio, device
+        )
+
+        # Apply RF noise to noisy patches; clean patches stay intact.
+        eps = torch.randn_like(target_patches)
+        t_b = t.view(B, 1, 1)
+        x_t = (1 - t_b) * target_patches + t_b * eps        # (B, N, D), all-noisy version
+        v = eps - target_patches                             # target on noisy positions
+        m = noisy_mask.unsqueeze(-1).float()                 # (B, N, 1) — 1 = noisy
+        mixed_patches = m * x_t + (1 - m) * target_patches
+
+        mixed_imgs = self.unpatchify(mixed_patches, img_size=img_size)
+
+        # Encoder with indicators + time. Sinusoidal embed expects an int range
+        # consistent with the DDPM path (already what RF naive does).
+        t_int = (t * (self.diffusion.num_timesteps - 1)).long()
+        cls_token, patch_tokens = self._encode_with_indicators(mixed_imgs, noisy_mask, t_int)
+
+        pred_v = self.decoder(patch_tokens)
+        pred_x0 = self.decoder_pix(patch_tokens)
+        pred_v = self._apply_conv_refine(pred_v)
+        pred_x0 = self._apply_conv_refine(pred_x0)
+
+        # Loss only on noisy positions (clean ones are tautological for both heads)
+        loss_v = self._masked_mse(pred_v, v, noisy_mask)
+        loss_x0 = self._masked_mse(pred_x0, target_patches, noisy_mask)
+
+        loss = loss_v + self.pixel_loss_weight * loss_x0
+
+        log_dict = {
+            'loss': loss.detach(),
+            'noisy_loss': loss_v.detach(),     # v loss reported as "noisy_loss"
+            'clean_loss': loss_x0.detach(),    # x0 loss reported as "clean_loss"
+            't_min': 0,
+            't_max': self.diffusion.num_timesteps,
+            'clean_ratio': self.clean_ratio,
+            't_mean': t.mean().detach(),
         }
         return loss, log_dict
 

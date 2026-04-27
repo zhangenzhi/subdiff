@@ -1,0 +1,88 @@
+# Dual-head Rectified Flow with clean-prompt patches.
+# Positioned as INPAINT / PROMPT-TO-IMAGE, NOT unconditional generation.
+#
+# Architecture (= Run 7 dual-decoder, but with RF v-target instead of DDPM ε):
+#   Input  = 25% clean (prompt) + 75% RF-noised patches
+#   Encoder (DiTEncoder + QK-Norm + adaLN-Zero) sees the mix, with
+#     learnable clean/noisy indicators added per token (use_indicators=true).
+#   Heads (both minimal Linear, zero-init):
+#     - decoder      → v = ε − x_0  (RF, high-frequency detail)
+#     - decoder_pix  → x_0          (MAE, global structure)
+#   Loss on the 75% noisy positions only:
+#     L = L_v + pixel_loss_weight · L_x0
+#
+# Why this is inpaint, not generation:
+#   Run 7 (this same architecture with DDPM ε) had mode collapse at
+#   unconditional sampling — at test time there are no clean anchors and
+#   the encoder OOD-collapses to a "mean-image" prior. We avoid that here
+#   by REQUIRING the clean prompt at inference (= image completion task).
+#   Train and test share the same input distribution.
+#
+# At inference:
+#   user supplies a clean image, we randomly noise 75% of its patches, then
+#   the model fills them in. Use scripts/sample_flow.py with an inpaint mode
+#   (to be added) — single Euler trajectory keeping clean positions fixed.
+
+data:
+  imagenet_dir: /lustre1/work/c30636/dataset/imagenet
+  image_size: 224
+  num_workers: 8
+  transform_type: diffusion
+
+model:
+  patch_size: 16
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  decoder_embed_dim: 512    # unused with dit_minimal_head
+  decoder_depth: 4
+  decoder_num_heads: 8
+  dual_decoder: true        # enables decoder_pix head
+  clean_ratio: 0.25         # 25% clean prompt, 75% noisy
+  pixel_loss_weight: 1.0    # equal weight: L = L_v + 1·L_x0
+  qk_norm: true
+  dit_minimal_head: true    # both heads are zero-init Linear
+  use_indicators: true      # tell encoder which patches are prompt vs noisy
+  pos_embed_type: sincos
+
+diffusion:
+  num_timesteps: 1000       # used only for time_embed scalar scaling
+  beta_start: 0.0001
+  beta_end: 0.02
+  schedule_type: linear
+  flow_matching: true       # routes to _forward_dual_rf
+  rf_t_sampling: logit_normal
+  rf_logit_mean: 0.0
+  rf_logit_std: 1.0
+
+curriculum:
+  t_min_start: 0
+  t_min_end: 0
+  t_max_start: 0
+  t_max_end: 0
+  clean_ratio_start: 0.25
+  clean_ratio_end: 0.25
+  warmup_epochs: 0
+  schedule: linear
+
+training:
+  epochs: 300
+  batch_size: 256
+  lr: 1.0e-4
+  min_lr: 1.0e-6
+  weight_decay: 0.0
+  warmup_epochs: 0
+  lr_schedule: constant
+  optimizer: adamw
+  clip_grad: 1.0
+
+probe:
+  eval_every: 20
+  probe_lr: 0.1
+  probe_epochs: 30
+  num_classes: 1000
+
+logging:
+  log_dir: ./logs_dual_rf
+  save_every: 5
+  print_every: 100

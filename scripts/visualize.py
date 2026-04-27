@@ -211,6 +211,75 @@ def _visualize_naive_rf(model, imgs, epoch, save_dir, device, n_samples=4):
 
 
 @torch.no_grad()
+def _visualize_dual_rf(model, imgs, epoch, save_dir, device, n_samples=4):
+    """Dual-head RF + clean-prompt viz (inpaint / prompt-to-image).
+
+    Same x_t = (1−t)x_0 + t·ε construction as _visualize_naive_rf, but applied
+    only to the ~75% noisy patches; the other ~25% stay clean (the "prompt").
+
+    Columns:
+      1. Original x_0
+      2. Mixed input (clean prompt + RF-noised patches at t=0.5)
+      3. v̂-head x̂_0 = x_t − t·v̂  (RF reverse, only meaningful on noisy)
+      4. x_0-head direct prediction (MAE-style reconstruction, on noisy)
+      5. Composite: clean prompt + x_0-head fill — the inpaint output
+    """
+    B = imgs.shape[0]
+    img_size = int(model.patch_size * (model.num_patches ** 0.5))
+
+    target_patches = model.patchify(imgs)
+    t_cont = torch.full((B,), 0.5, device=device)
+    t_b = t_cont.view(B, 1, 1)
+
+    # 25% clean / 75% RF-noised mix
+    noisy_mask = model.diffusion.generate_noisy_mask(
+        B, model.num_patches, model.clean_ratio, device
+    )
+    eps = torch.randn_like(target_patches)
+    x_t_all = (1 - t_b) * target_patches + t_b * eps
+    m = noisy_mask.unsqueeze(-1).float()
+    mixed_patches = m * x_t_all + (1 - m) * target_patches
+    mixed_imgs = model.unpatchify(mixed_patches, img_size=img_size)
+
+    t_int = (t_cont * (model.diffusion.num_timesteps - 1)).long()
+    cls_token, patch_tokens = model._encode_with_indicators(mixed_imgs, noisy_mask, t_int)
+
+    pred_v = model.decoder(patch_tokens)
+    pred_x0 = model.decoder_pix(patch_tokens)
+    pred_v = model._apply_conv_refine(pred_v)
+    pred_x0 = model._apply_conv_refine(pred_x0)
+
+    # v-head lookahead to t=0 on noisy positions; clean positions kept
+    v_x0_patches = mixed_patches - t_b * pred_v
+    v_x0_patches = m * v_x0_patches + (1 - m) * target_patches
+
+    # x_0-head fill: composite clean prompt + x_0-head prediction on noisy
+    composite_patches = m * pred_x0 + (1 - m) * target_patches
+
+    v_x0_img = model.unpatchify(v_x0_patches, img_size=img_size)
+    pix_img = model.unpatchify(pred_x0, img_size=img_size)
+    composite_img = model.unpatchify(composite_patches, img_size=img_size)
+
+    clean_vis = denormalize(imgs)
+    mixed_vis = denormalize(mixed_imgs)
+    v_vis = denormalize(v_x0_img)
+    pix_vis = denormalize(pix_img)
+    composite_vis = denormalize(composite_img)
+
+    titles = [
+        "Original x_0",
+        f"Mixed input\n(prompt={1-model.clean_ratio:.0%} noisy, t=0.5)",
+        "v-head x̂_0 (Euler→0)",
+        "x_0-head raw",
+        "Inpaint composite",
+    ]
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f"vis_epoch_{epoch:04d}.png")
+    save_grid([clean_vis, mixed_vis, v_vis, pix_vis, composite_vis],
+              titles, save_path, nrow=n_samples)
+
+
+@torch.no_grad()
 def _visualize_naive_mae(model, imgs, epoch, save_dir, device, n_samples=4):
     """Naive MAE viz: Original | Masked Input | Reconstruction."""
     B = imgs.shape[0]
@@ -360,7 +429,10 @@ def visualize_epoch(model, imgs, epoch, save_dir, device, n_samples=4):
     # Rectified Flow (v-pred) — check BEFORE naive_ddpm because RF+MAE has
     # both flags set (naive_ddpm=True, flow_matching=True)
     if getattr(model, 'flow_matching', False):
-        _visualize_naive_rf(model, imgs, epoch, save_dir, device, n_samples)
+        if getattr(model, 'dual_decoder', False):
+            _visualize_dual_rf(model, imgs, epoch, save_dir, device, n_samples)
+        else:
+            _visualize_naive_rf(model, imgs, epoch, save_dir, device, n_samples)
         model.train()
         return
 
@@ -475,13 +547,10 @@ def visualize_epoch(model, imgs, epoch, save_dir, device, n_samples=4):
     model.train()
 
 
-def visualize_from_checkpoint(config_path, checkpoint_path, save_dir, epoch_override=None):
-    """Load a checkpoint and produce visualization."""
-    with open(config_path) as f:
-        cfg = yaml.safe_load(f)
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
+def _build_model_from_cfg(cfg, device):
+    """Instantiate SubDiff from a config dict, wiring all flags the way
+    scripts/pretrain.py does. Keeping this parallel to pretrain.py so
+    visualization matches training-time behavior."""
     curriculum_cfg = {
         't_min_start': cfg['curriculum']['t_min_start'],
         't_min_end': cfg['curriculum']['t_min_end'],
@@ -492,8 +561,7 @@ def visualize_from_checkpoint(config_path, checkpoint_path, save_dir, epoch_over
         'warmup_epochs': cfg['curriculum']['warmup_epochs'],
         'schedule': cfg['curriculum']['schedule'],
     }
-
-    model = SubDiff(
+    return SubDiff(
         img_size=cfg['data']['image_size'],
         patch_size=cfg['model']['patch_size'],
         embed_dim=cfg['model']['embed_dim'],
@@ -508,10 +576,46 @@ def visualize_from_checkpoint(config_path, checkpoint_path, save_dir, epoch_over
         schedule_type=cfg['diffusion']['schedule_type'],
         total_epochs=cfg['training']['epochs'],
         curriculum_cfg=curriculum_cfg,
+        predict_noise=cfg.get('diffusion', {}).get('predict_noise', False),
+        mae_masking=cfg.get('model', {}).get('mae_masking', False),
+        mask_ratio=cfg.get('model', {}).get('mask_ratio', 0.25),
+        dual_decoder=cfg.get('model', {}).get('dual_decoder', False),
+        clean_ratio=cfg.get('model', {}).get('clean_ratio', 0.25),
+        pixel_loss_weight=cfg.get('model', {}).get('pixel_loss_weight', 1.0),
+        naive_mae=cfg.get('model', {}).get('naive_mae', False),
+        naive_ddpm=cfg.get('model', {}).get('naive_ddpm', False),
+        qk_norm=cfg.get('model', {}).get('qk_norm', False),
+        dit_minimal_head=cfg.get('model', {}).get('dit_minimal_head', False),
+        use_indicators=cfg.get('model', {}).get('use_indicators', False),
+        use_conv_refine=cfg.get('model', {}).get('use_conv_refine', False),
+        loss_weighting=cfg.get('diffusion', {}).get('loss_weighting', 'simple'),
+        snr_gamma=cfg.get('diffusion', {}).get('snr_gamma', 5.0),
+        pos_embed_type=cfg.get('model', {}).get('pos_embed_type', 'sincos'),
+        flow_matching=cfg.get('diffusion', {}).get('flow_matching', False),
+        rf_t_sampling=cfg.get('diffusion', {}).get('rf_t_sampling', 'logit_normal'),
+        rf_logit_mean=cfg.get('diffusion', {}).get('rf_logit_mean', 0.0),
+        rf_logit_std=cfg.get('diffusion', {}).get('rf_logit_std', 1.0),
+        rf_mae_enabled=cfg.get('diffusion', {}).get('rf_mae_enabled', False),
+        rf_mae_max_mask=cfg.get('diffusion', {}).get('rf_mae_max_mask', 0.5),
+        mae_aux_weight=cfg.get('diffusion', {}).get('mae_aux_weight', 0.1),
     ).to(device)
 
-    ckpt = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(ckpt['model'])
+
+def visualize_from_checkpoint(config_path, checkpoint_path, save_dir, epoch_override=None):
+    """Load a checkpoint and produce visualization."""
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    model = _build_model_from_cfg(cfg, device)
+
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    state = ckpt['model']
+    # Skip loading pos_embed when using fixed sin-cos (mirrors pretrain.py resume)
+    if getattr(model.encoder, 'pos_embed_type', 'learnable') == 'sincos':
+        state = {k: v for k, v in state.items() if not k.endswith('encoder.pos_embed')}
+    model.load_state_dict(state, strict=False)
     epoch = epoch_override if epoch_override is not None else ckpt['epoch']
     print(f"Loaded checkpoint epoch {ckpt['epoch']}, visualizing as epoch {epoch}")
 
