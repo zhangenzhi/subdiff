@@ -20,27 +20,33 @@ Remaining stability tasks (low priority):
 - EMA weights (decay 0.9999) for inference quality — standard practice,
   expected to improve FID but not critical for current training.
 
-## Priority 0 — Run RF + MAE mask (Run 10, ready to launch)
+## DONE — Run 10 RF + MAE mask validated
 
-Implemented but not yet trained. Config: `pretrain_vit_b16_naive_rf_mae.yaml`.
-Launch with:
-```
-torchrun --nproc_per_node=4 scripts/pretrain.py \
-  --config configs/pretrain_vit_b16_naive_rf_mae.yaml
-```
-Key checks:
-- Epoch-0 visible loss should be comparable to Run 9 (naive RF) — if much
-  higher, mask_token is disrupting training; retune `rf_mae_max_mask`.
-- Sampling with `scripts/sample_flow.py` at epoch 5-10: look for emergent
-  object contours vs Run 9's "impressionistic tiles."
-- If coherence improves but pixel sharpness drops, the trade-off is
-  as expected. Next step: combine with Conv-refine head.
+Run 10 trained 169 ep (24h walltime, 2 GPU). visible v-loss 0.187 at
+ep 163 ≤ Run 9 ep 299 best (0.191). 50-step samples match Run 9 ep 299
+quality. Single-pass MAE inpainting works (`scripts/inpaint_rf_mae.py`).
+Verdict: **MAE auxiliary task accelerates RF convergence by ~45% epochs
+to the same quality.** First clear architectural win at 224×16 pixel
+space.
+
+## Priority 0 — Run 11 dual-head RF for inpainting (in progress)
+
+Launched on 4 GPU after 2026-04-27. Config: `pretrain_vit_b16_dual_rf.yaml`.
+Positioned as **image completion / prompt-to-image**, not unconditional
+generation (avoids Run 7 mode collapse by requiring 25% clean prompt at
+inference, matching training distribution).
+
+Key checks during training:
+- visible v-loss should track Run 9 / Run 10 trajectory (~0.20 by ep 80).
+- x_0-head loss should descend lower than Run 10's masked residual
+  (Run 10 had Var(ε)=1.0 floor; Run 11's x_0 target has no such floor).
 
 Exit criteria:
-- If contours are clearly better than naive RF → this is the new best
-  pixel-space 224×16 recipe; push toward FID evaluation.
-- If no visible improvement → mask ratio / aux weight sweep, or conclude
-  that pixel-space 224×16 needs a structured head instead.
+- If x_0-head loss < 0.15 by ep 50 and v-head loss ≈ Run 10 → both heads
+  are learning their respective targets cleanly.
+- Then build `scripts/inpaint_rf_dual.py` doing the two-stage pipeline
+  (x_0-head init + v-head Euler refinement) and compare visual sharpness
+  to Run 10's single-pass output at matched mask ratios.
 
 ## Priority 1 — Verify the "pix head helps ε head" finding
 

@@ -320,37 +320,68 @@ pixels arrange *within* a token's output. Latent DiT sidesteps this by
 having a VAE decoder provide intra-patch structure; in pixel space we pay
 the full cost.
 
-### Test 2: change the loss target (Run 9, naive RF)
+### Test 2: change the loss target (Run 9, naive RF — 300 epochs)
 
 Replaced DDPM ε-pred with Rectified Flow v-pred + logit-normal t + linear
-interpolation path (SD3/FLUX ingredients). Loss trains stably. Samples:
-**same "impressionistic tiles" as naive DDPM**. v-prediction changes the
-loss landscape and the noise→data path, but not the per-token head.
+interpolation path (SD3/FLUX ingredients). Loss trains stably to 0.191.
 
-**Conclusion**: the 224×16 tiled failure is architectural (head-level),
-not objective-level. Changing ε→v cannot fix it.
+**Update from longer training**: at ep 299 the naive RF generates
+**recognizable images** (standing figures, animals, landscapes) with no
+visible patch boundaries. The "impressionistic tiles" outputs were a
+transient mid-training phase, not a terminal failure mode. Pixel-space
+ViT-B at 224×16 *can* produce coherent samples — it just takes ~300
+epochs at 4× H100 to settle.
 
-### Next attempt: RF + MAE mask (Run 10, implemented, not yet launched)
+So: the 224×16 limitation is **per-pixel sharpness**, not global
+structure. Loss changes don't bypass that, but the failure is less
+catastrophic than the early-epoch evidence suggested.
 
-MaskDiT-style mask-token replacement before the encoder. Rationale: force
-the encoder/attention to infer masked tokens purely from context, growing
-cross-patch priors. Symmetric (all tokens flow through the encoder); mask
-ratio r ~ U(0, 0.5) per step so training covers r=0 (the sampling
-distribution). Loss: `L_visible + 0.1 · L_masked` on v.
+### Test 3: RF + MAE mask (Run 10, completed 169 epochs)
 
-Expectation: more structural coherence at the cost of per-patch
-sharpness. If this helps, the natural follow-up is Conv-refine head to
-recover some sharpness.
+MaskDiT-style mask-token replacement before the encoder. r ~ U(0, 0.5)
+per step (covers r=0 → matches naive sampling). v-prediction loss on all
+positions: `L = L_visible + 0.1 · L_masked`.
+
+**Outcome (vs Run 9)**:
+- visible v-loss reached 0.187 at ep 163 — already ≤ Run 9 ep 299's 0.191.
+- 50-step Euler samples match Run 9 ep 299 quality (qualitative grid
+  comparison).
+- ~45% fewer epochs to equivalent generation quality.
+- Bonus: single-pass inpainting works directly via `−pred_v` at masked
+  positions (theoretically optimal predictor under the MAE loss).
+
+Reframed motivation in retrospect: "MAE auxiliary on shared encoder gives
+a global-representation gradient signal, while RF main task gives the
+high-frequency signal. Both ride the same forward pass." Empirically the
+two heads do not interfere; the dual signal makes the encoder converge
+faster on the global pathway.
+
+### Test 4: Dual-head RF + clean prompt for inpainting (Run 11)
+
+Run 7's dual-decoder failed at unconditional sampling via mode collapse.
+The architectural pattern (25% clean + 75% noisy + dual heads) gives
+strong representation learning but creates an inference OOD gap (no clean
+anchors at sampling). RF v-target alone wouldn't fix that.
+
+Run 11 sidesteps the issue by **redefining the task as image completion**.
+At inference, real clean prompts are provided (matching training); train
+and test share the same input distribution; mode collapse cannot occur.
+The two heads then become the two stages of iterative inpainting:
+x_0-head provides a global init, v-head iterates Euler reverse on the
+unknown positions to refine high frequencies, clean prompt patches stay
+anchored throughout.
 
 ## Open questions
 
-1. Is the dual finding real and reproducible? (priority 1, see todo.md)
-2. What is the downstream FID advantage (if any) of dual over naive when used
-   as pretraining for a longer diffusion finetune?
-3. Does the pix head's positive contribution to ε learning persist throughout
-   training, or is it only early?
-4. **Does RF + MAE mask produce object-level coherence at 224×16?** (Run 10,
-   implemented). If yes, this is the first architectural fix for the tiled
-   failure that doesn't require leaving pixel space.
-5. If RF + MAE still fails, is the right next step a structured head
-   (Conv refine / UNet-style decoder) or abandoning 224×16 for latent DiT?
+1. **Run 11 inpainting quality vs Run 10 single-pass**: does the iterative
+   pipeline (x_0-head init + v-head Euler refinement) produce visibly
+   sharper completions at the same mask ratio?
+2. How does the downstream classification finetune performance compare
+   across Run 9 (naive RF), Run 10 (RF+MAE), and Run 11 (dual-RF inpaint)?
+   Does the MAE auxiliary signal in Runs 10/11 give a measurable cls top-1
+   advantage like Run 1's pixel-recon pretraining did (+11%)?
+3. Run 10's masked v-loss has an irreducible Var(ε)=1.0 floor; Run 11's
+   x_0-head loss does not. Will Run 11's x_0-head residual descend below
+   Run 10's recovered 0.174, indicating cleaner global learning?
+4. EMA weights (decay 0.9999) — would likely sharpen sample details for
+   any of these runs; not yet implemented.
