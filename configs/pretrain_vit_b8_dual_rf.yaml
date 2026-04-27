@@ -1,0 +1,81 @@
+# Dual-head Rectified Flow with clean-prompt patches at PATCH_SIZE=8.
+# Same architecture as Run 11 (pretrain_vit_b16_dual_rf.yaml), only the
+# tokenization granularity changes:
+#   patch_size 16 → 8   (224×224 → 28×28 patch grid → 784 tokens, 4× more)
+#   patch_dim  768 → 192  (per-token output is smaller, easier on the head)
+#
+# Why this might help (Run 8 already showed patch_size is the bottleneck for
+# pixel-space sharpness at 224×16):
+#   - Each token covers fewer pixels → per-token Linear head can express
+#     finer intra-patch structure
+#   - 28×28 grid → finer cross-patch attention vocabulary
+#   - Compute cost: attention scales O(N²) so ~16× per attention block
+#     vs Run 11; offset by 16× GPUs (4 → 16) keeping wall time similar
+#
+# Memory note: with FlashAttention-2 the activation memory is O(N) not O(N²),
+# so batch_size=256/GPU should still fit on H100 80GB. If OOM, drop to 128.
+
+data:
+  imagenet_dir: /lustre1/work/c30636/dataset/imagenet
+  image_size: 224
+  num_workers: 8
+  transform_type: diffusion
+
+model:
+  patch_size: 8             # ← was 16
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  decoder_embed_dim: 512    # unused with dit_minimal_head
+  decoder_depth: 4
+  decoder_num_heads: 8
+  dual_decoder: true
+  clean_ratio: 0.25
+  pixel_loss_weight: 1.0
+  qk_norm: true
+  dit_minimal_head: true
+  use_indicators: true
+  pos_embed_type: sincos    # 28×28 grid, embed_dim=768 div by 4 — fine
+
+diffusion:
+  num_timesteps: 1000
+  beta_start: 0.0001
+  beta_end: 0.02
+  schedule_type: linear
+  flow_matching: true
+  rf_t_sampling: logit_normal
+  rf_logit_mean: 0.0
+  rf_logit_std: 1.0
+
+curriculum:
+  t_min_start: 0
+  t_min_end: 0
+  t_max_start: 0
+  t_max_end: 0
+  clean_ratio_start: 0.25
+  clean_ratio_end: 0.25
+  warmup_epochs: 0
+  schedule: linear
+
+training:
+  epochs: 300
+  batch_size: 64            # per GPU; global = 64 × 16 = 1024
+                            # (256/GPU OOMs on H100 80GB at N=784 with bf16)
+  lr: 1.0e-4                # constant; effective batch 1024 — match Run 9/10/11
+  min_lr: 1.0e-6
+  weight_decay: 0.0
+  warmup_epochs: 0
+  lr_schedule: constant
+  optimizer: adamw
+  clip_grad: 1.0
+
+probe:
+  eval_every: 20
+  probe_lr: 0.1
+  probe_epochs: 30
+  num_classes: 1000
+
+logging:
+  log_dir: ./logs_dual_rf_p8
+  save_every: 5
+  print_every: 100
