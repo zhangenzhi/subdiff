@@ -426,6 +426,12 @@ def visualize_epoch(model, imgs, epoch, save_dir, device, n_samples=4):
     imgs = imgs[:n_samples].to(device)
     B = imgs.shape[0]
 
+    # Cold-RF (Run 12): training-time viz needs the frozen mu_model to
+    # provide μ. Skip in-loop viz here; use scripts/inpaint_cold_dual.py
+    # off-line at chosen epochs instead.
+    if getattr(model, 'cold_rf', False):
+        return
+
     # Rectified Flow (v-pred) — check BEFORE naive_ddpm because RF+MAE has
     # both flags set (naive_ddpm=True, flow_matching=True)
     if getattr(model, 'flow_matching', False):

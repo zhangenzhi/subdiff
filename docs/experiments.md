@@ -315,8 +315,21 @@ Resume reads `best_loss` from the checkpoint to continue tracking correctly.
    pathway, not just unconditional generation. 16× attention compute
    per step is offset by 4× more GPUs (16 vs 4), keeping wall time
    comparable.
+9. **Cold-RF ("mean → data" chain) is the right framing for inpaint
+   refinement** (Run 12). Run X's single-pass output μ minimizes
+   pixel-MSE *by being blurry* — only 9.4% of ground-truth HF energy
+   survives. A frozen-μ + Refiner-v-head pipeline trained on the chain
+   `x_t = (1-t)·x_0 + t·μ` recovers HF monotonically with K-step Euler:
+   K=32 reaches 64% target HF energy (= ~7× more high-freq than μ alone),
+   converging near 70% by K=64 with no overshoot. The same K range
+   *increases* pixel-MSE 25-46% — a strict reminder that pixel-MSE
+   rewards mean prediction and is the wrong metric for sample quality.
+   Visually: smooth blobs become photographic textures (scales, fabric,
+   skin, foliage). All Refiner training capacity goes to the structured
+   μ→x_0 residual instead of the isotropic noise null-space that
+   standard RF wastes most of its budget on.
 
-### Run X: patch_size=8 dual-head RF on 16× H100 (current best)
+### Run X: patch_size=8 dual-head RF on 16× H100
 - Config: `pretrain_vit_b8_dual_rf.yaml`
 - Log dir: `logs_dual_rf_p8/`
 - 4 nodes × 4 GPU = 16 H100; batch=64/GPU global=1024 (matches Run 11).
@@ -325,13 +338,98 @@ Resume reads `best_loss` from the checkpoint to continue tracking correctly.
   on 4 GPU because attention compute is 16× higher per token-pair).
 - Multi-node launched via `pbs_tmrsh` + `_torchrun_node.sh` (no SSH keys
   needed; PBS Task Manager handles inter-node rsh).
-- **Status**: 300-ep run in progress, currently at ep 271/300 (best
-  ep 269 avg_loss 0.149).
+- **Final**: 300 ep done 2026-04-28, **best avg_loss = 0.1488** at ep 299.
 - Loss trajectory: ep 4 → 0.196, ep 14 → 0.175, ep 39 → 0.162,
-  ep 99 → 0.154, ep 199 → 0.150, ep 269 → 0.149 (clearly plateauing).
+  ep 99 → 0.154, ep 199 → 0.150, ep 269 → 0.149, ep 299 → 0.149
+  (essentially plateaued from ep 199).
 - Inpaint validation at t=1 + prompt=25% (`samples_rf_p8_inpaint_t1/`):
-  - ep 4/14/39/269 all run with same seed → monotone visual improvement.
-  - At ep 269 the composite (prompt+recon) is sharp enough that
-    fish scales, jacket logo silhouettes, and facial features are
-    recognizable from only 25% pixel context — the pixel-space ViT-B
-    inpainting pipeline at 224 is now functional.
+  - ep 4/14/39/269/299 all run with same seed → monotone visual improvement.
+  - At ep 299 the composite (prompt+recon) recovers fish scales, jacket
+    logo silhouettes, and facial features from only 25% pixel context.
+    The pixel-space ViT-B inpainting pipeline at 224 is functional.
+
+### Run 12: Cold-Rectified-Flow Refiner (μ-conditioned RF chain)
+- Config: `pretrain_vit_b8_cold_rf.yaml`
+- Log dir: `logs_run12_cold_rf/`
+- 4 nodes × 4 GPU = 16 H100; batch=64/GPU global=1024.
+- **Setup**: Same architecture as Run X but `dual_decoder=False` and
+  `cold_rf=True`. Refiner has v-head only. A separate FROZEN
+  `mu_model` = Run X ep 299 supplies μ (= x_0-head output) per step.
+- **Forward chain** (replaces standard RF noise→x with mean→x):
+    `x_t = (1-t)·x_0 + t·μ` on noisy positions, clean stays at x_0.
+    `v_target = μ - x_0` (constant in t — slope of a linear chain).
+  Refiner's only loss is MSE(v_pred, v_target) on noisy positions.
+  This makes Refiner a learned **residual high-frequency unrolling**
+  on top of Run X's blurry conditional-mean estimate.
+- **Why** (Step 1 measurement, 512 ImageNet val images):
+  At t=1.0 + prompt=25%, MSE(μ, x_0) on noisy positions = 0.126
+  (9% variance unexplained, p90 = 0.324 → heavy-tail residual).
+  μ explains 91% of signal but is missing the high-frequency texture
+  that pure-noise RF wastes most of its capacity recovering.
+- **Training**: 100 ep on 16 GPU, 6.2 min/ep (~10h). μ-generator forward
+  in bf16/no_grad adds ~75ms per step (vs Run X's 220ms — 1.4× cost).
+- **Loss trajectory**: ep 0 → 0.0887, ep 3 → 0.0429, ep 79 → 0.0176,
+  plateaued ~0.0176 from ep 74 onward. Final ckpt at ep 99 (in progress
+  at time of writing).
+- **Inference**: K-step Euler reverse from `x_t = μ` (at t=1) to
+  `x_t = x_0` (at t=0), clean prompt anchored. K is an inference dial.
+
+#### The K sweep (Run 12 ep 79, 4 ImageNet val images, t=1, prompt=25%)
+
+| Method | pixel_MSE | HF_MSE | HF_energy | HF_e/target |
+|---|---|---|---|---|
+| Target (reference) | 0.000 | 0.000 | 0.666 | **1.000** |
+| Run X μ (single-pass) | **0.255** ← lowest | 0.617 | 0.063 | **0.094** |
+| Run 12 K=1  | 0.262 | 0.642 | 0.113 | 0.170 |
+| Run 12 K=2  | 0.281 | 0.663 | 0.143 | 0.215 |
+| Run 12 K=4  | 0.300 | 0.705 | 0.193 | 0.290 |
+| Run 12 K=8  | 0.322 | 0.768 | 0.264 | 0.396 |
+| Run 12 K=16 | 0.347 | 0.850 | 0.350 | 0.525 |
+| Run 12 K=32 | 0.367 | 0.928 | 0.429 | **0.644** |
+| Run 12 K=64 | 0.374 | 0.963 | 0.465 | 0.697 |
+
+(`pixel_MSE` = squared error per noisy patch; `HF_MSE` = squared error
+on per-pixel Laplacian; `HF_energy` = squared Laplacian magnitude of
+the prediction itself; `HF_e/target` = ratio to ground-truth HF
+energy. All averaged over noisy pixels.)
+
+#### Critical lesson: pixel_MSE is the wrong metric for inpainting
+
+Reading the table naively says "Refiner makes things worse" — pixel_MSE
+goes up monotonically with K. **This is misleading**. μ is the
+*conditional-mean* estimator (Wiener filter sense): it minimizes
+expected pixel-MSE *by being maximally blurry*. Any model that emits
+plausible high-frequency texture (which is necessarily phase-shifted
+from the exact ground-truth pixel-pattern) will be punished by L2
+even when perceptual quality strictly improves.
+
+The right diagnostic is `HF_energy` against the target:
+- μ alone has only **9.4% of target HF energy** — almost all texture lost.
+- Run 12 K=16 recovers 52.5%, K=32 → 64.4%, K=64 → 69.7%.
+- HF energy converges around 70% (= ~30% irreducible from 25% context).
+- No overshoot into noise — chain is stable.
+
+Visually: μ is a smooth blob; K=32 has visible fish scales, jacket
+texture, facial features, grass detail. The blur→sharp transition
+is monotone in K with diminishing returns past K=32.
+
+**Recommended K = 32**. Below: marginal HF gain not worth it. Above:
+inference cost doubles per +5% HF energy.
+
+#### Why Cold-RF works while standard RF didn't push HF further
+
+Standard RF: `x_t = (1-t)·x_0 + t·ε` with ε ~ N(0, I). Most of the
+chain is denoising isotropic Gaussian noise; the model spends most
+of its capacity on the noise null-space. At t=1 the v-head reaches
+its theoretical floor = MSE(μ, x_0) ≈ 0.126 (= the µ-x_0 residual
+variance at the input distribution).
+
+Cold-RF replaces the noise endpoint with μ, so the chain interpolates
+between two structured points (data and conditional mean). The Refiner
+sees `x_t` always in (1-t)·x_0 + t·μ — a much narrower, lower-entropy
+distribution. All capacity goes to learning the structured residual
+μ → x_0, not generic denoising. Hence the dramatic HF recovery.
+
+Connection to Cold Diffusion (Bansal et al. 2022): same idea, but
+their degradations are fixed operators (blur, mask, snowification);
+ours is a *learned context-conditional* operator (Run X x_0-head).

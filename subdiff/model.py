@@ -75,8 +75,18 @@ class SubDiff(nn.Module):
                  flow_matching=False, rf_t_sampling='logit_normal',
                  rf_logit_mean=0.0, rf_logit_std=1.0,
                  rf_mae_enabled=False, rf_mae_max_mask=0.5,
-                 mae_aux_weight=0.1):
+                 mae_aux_weight=0.1,
+                 cold_rf=False):
         super().__init__()
+        # Run 12 / Cold-RF Refiner: trains a v-head on the chain
+        #   x_t = (1-t)·x_0 + t·μ
+        # where μ is produced by a separate frozen mu_model (typically Run X
+        # x_0-head). Refiner has v-head only (no x_0-head). The frozen
+        # mu_model is NOT registered as a submodule — it is attached at runtime
+        # by pretrain.py via set_cold_context() each step. See _forward_cold_rf.
+        self.cold_rf = cold_rf
+        self._cold_mu = None
+        self._cold_noisy_mask = None
 
         self.patch_size = patch_size
         self.num_patches = (img_size // patch_size) ** 2
@@ -87,7 +97,7 @@ class SubDiff(nn.Module):
         #     uses DiTEncoder with per-block adaLN-Zero time conditioning
         #     (prevents time-signal dilution through the 12-layer stack).
         #   - Plain pixel-reconstruction pretraining uses ViTEncoder.
-        use_dit_encoder = naive_ddpm or predict_noise or dual_decoder
+        use_dit_encoder = naive_ddpm or predict_noise or dual_decoder or cold_rf
         if use_dit_encoder:
             self.encoder = DiTEncoder(
                 img_size=img_size, patch_size=patch_size, in_channels=in_channels,
@@ -234,7 +244,7 @@ class SubDiff(nn.Module):
         # SubDiff eps-prediction paths (additive to patch tokens).
         # For pixel-only prediction without predict_noise, t is irrelevant
         # so we skip creating time_embed to avoid unused params.
-        if naive_ddpm or predict_noise or dual_decoder:
+        if naive_ddpm or predict_noise or dual_decoder or cold_rf:
             self.time_embed = SinusoidalTimeEmbedding(embed_dim)
         else:
             self.time_embed = None
@@ -354,6 +364,8 @@ class SubDiff(nn.Module):
             loss: reconstruction loss
             log_dict: dict with metrics for logging
         """
+        if self.cold_rf:
+            return self._forward_cold_rf(imgs, epoch)
         if self.flow_matching and self.dual_decoder:
             return self._forward_dual_rf(imgs, epoch)
         if self.flow_matching and self.naive_ddpm:
@@ -822,6 +834,90 @@ class SubDiff(nn.Module):
             'loss': loss.detach(),
             'noisy_loss': loss_v.detach(),     # v loss reported as "noisy_loss"
             'clean_loss': loss_x0.detach(),    # x0 loss reported as "clean_loss"
+            't_min': 0,
+            't_max': self.diffusion.num_timesteps,
+            'clean_ratio': self.clean_ratio,
+            't_mean': t.mean().detach(),
+        }
+        return loss, log_dict
+
+    def set_cold_context(self, mu, noisy_mask):
+        """Attach per-step μ and mask before _forward_cold_rf is called.
+
+        pretrain.py calls this before model.forward(imgs, epoch) so DDP
+        forward signature stays untouched. mu must be (B, N, D), noisy_mask
+        (B, N) bool.
+        """
+        self._cold_mu = mu
+        self._cold_noisy_mask = noisy_mask
+
+    @torch.no_grad()
+    def compute_mu(self, imgs, noisy_mask):
+        """Inpaint-inference forward through this model's x_0-head at t=1
+        with pure noise at noisy positions and clean prompt elsewhere.
+        Used by the frozen mu_model in Run 12. Requires dual_decoder=True
+        and decoder_pix to exist on this model.
+        """
+        assert self.decoder_pix is not None, "compute_mu needs an x_0-head"
+        B = imgs.shape[0]
+        device = imgs.device
+        img_size = int(self.patch_size * (self.num_patches ** 0.5))
+        target_patches = self.patchify(imgs)
+        m = noisy_mask.unsqueeze(-1).float()
+        eps = torch.randn_like(target_patches)
+        mixed = (1 - m) * target_patches + m * eps
+        mixed_imgs = self.unpatchify(mixed, img_size=img_size)
+        t_int = torch.full((B,), self.diffusion.num_timesteps - 1,
+                           device=device, dtype=torch.long)
+        cls_token, patch_tokens = self._encode_with_indicators(
+            mixed_imgs, noisy_mask, t_int)
+        mu = self.decoder_pix(patch_tokens)
+        mu = self._apply_conv_refine(mu)
+        return mu
+
+    def _forward_cold_rf(self, imgs, epoch=0):
+        """Run 12 / Cold-RF Refiner training step.
+
+        Chain: x_t = (1-t)·x_0 + t·μ on noisy positions, clean stays at x_0.
+        Target: v = μ - x_0 (constant in t — derivative of the chain).
+        Loss: MSE(v_pred, v) on noisy positions only.
+
+        Requires self._cold_mu and self._cold_noisy_mask to be set externally
+        (by pretrain.py via set_cold_context) — we don't fold the frozen
+        mu_model into this class to keep state_dict / DDP / checkpoints clean.
+        """
+        assert self._cold_mu is not None and self._cold_noisy_mask is not None, \
+            "set_cold_context(mu, noisy_mask) must be called before forward"
+        B = imgs.shape[0]
+        device = imgs.device
+        img_size = int(self.patch_size * (self.num_patches ** 0.5))
+
+        target_patches = self.patchify(imgs)
+        mu = self._cold_mu                                  # (B, N, D), no_grad
+        noisy_mask = self._cold_noisy_mask
+        m = noisy_mask.unsqueeze(-1).float()
+
+        t = self.rf.sample_t(B, device)
+        t_b = t.view(B, 1, 1)
+
+        # Cold chain at noisy positions; clean positions stay = x_0
+        x_t_noisy = (1 - t_b) * target_patches + t_b * mu
+        v_target = mu - target_patches                       # constant in t
+        mixed_patches = m * x_t_noisy + (1 - m) * target_patches
+        mixed_imgs = self.unpatchify(mixed_patches, img_size=img_size)
+
+        t_int = (t * (self.diffusion.num_timesteps - 1)).long()
+        cls_token, patch_tokens = self._encode_with_indicators(
+            mixed_imgs, noisy_mask, t_int)
+        pred_v = self.decoder(patch_tokens)
+        pred_v = self._apply_conv_refine(pred_v)
+
+        loss = self._masked_mse(pred_v, v_target, noisy_mask)
+
+        log_dict = {
+            'loss': loss.detach(),
+            'noisy_loss': loss.detach(),
+            'clean_loss': torch.tensor(0.0, device=device),
             't_min': 0,
             't_max': self.diffusion.num_timesteps,
             'clean_ratio': self.clean_ratio,

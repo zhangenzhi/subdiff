@@ -43,6 +43,48 @@ def load_config(path):
         return yaml.safe_load(f)
 
 
+def build_subdiff_from_cfg(cfg, curriculum_cfg):
+    return SubDiff(
+        img_size=cfg['data']['image_size'],
+        patch_size=cfg['model']['patch_size'],
+        embed_dim=cfg['model']['embed_dim'],
+        depth=cfg['model']['depth'],
+        num_heads=cfg['model']['num_heads'],
+        decoder_dim=cfg['model']['decoder_embed_dim'],
+        decoder_depth=cfg['model']['decoder_depth'],
+        decoder_num_heads=cfg['model']['decoder_num_heads'],
+        num_timesteps=cfg['diffusion']['num_timesteps'],
+        beta_start=cfg['diffusion']['beta_start'],
+        beta_end=cfg['diffusion']['beta_end'],
+        schedule_type=cfg['diffusion']['schedule_type'],
+        total_epochs=cfg['training']['epochs'],
+        curriculum_cfg=curriculum_cfg,
+        predict_noise=cfg.get('diffusion', {}).get('predict_noise', False),
+        mae_masking=cfg.get('model', {}).get('mae_masking', False),
+        mask_ratio=cfg.get('model', {}).get('mask_ratio', 0.25),
+        dual_decoder=cfg.get('model', {}).get('dual_decoder', False),
+        clean_ratio=cfg.get('model', {}).get('clean_ratio', 0.25),
+        pixel_loss_weight=cfg.get('model', {}).get('pixel_loss_weight', 1.0),
+        naive_mae=cfg.get('model', {}).get('naive_mae', False),
+        naive_ddpm=cfg.get('model', {}).get('naive_ddpm', False),
+        qk_norm=cfg.get('model', {}).get('qk_norm', False),
+        dit_minimal_head=cfg.get('model', {}).get('dit_minimal_head', False),
+        use_indicators=cfg.get('model', {}).get('use_indicators', False),
+        use_conv_refine=cfg.get('model', {}).get('use_conv_refine', False),
+        loss_weighting=cfg.get('diffusion', {}).get('loss_weighting', 'simple'),
+        snr_gamma=cfg.get('diffusion', {}).get('snr_gamma', 5.0),
+        pos_embed_type=cfg.get('model', {}).get('pos_embed_type', 'sincos'),
+        flow_matching=cfg.get('diffusion', {}).get('flow_matching', False),
+        rf_t_sampling=cfg.get('diffusion', {}).get('rf_t_sampling', 'logit_normal'),
+        rf_logit_mean=cfg.get('diffusion', {}).get('rf_logit_mean', 0.0),
+        rf_logit_std=cfg.get('diffusion', {}).get('rf_logit_std', 1.0),
+        rf_mae_enabled=cfg.get('diffusion', {}).get('rf_mae_enabled', False),
+        rf_mae_max_mask=cfg.get('diffusion', {}).get('rf_mae_max_mask', 0.5),
+        mae_aux_weight=cfg.get('diffusion', {}).get('mae_aux_weight', 0.1),
+        cold_rf=cfg.get('model', {}).get('cold_rf', False),
+    )
+
+
 def cosine_lr_schedule(optimizer, epoch, total_epochs, warmup_epochs, lr, min_lr,
                        schedule='cosine'):
     """Returns current lr. Supports 'cosine' (default, with warmup + cosine decay)
@@ -112,48 +154,47 @@ def main():
         'schedule': cfg['curriculum']['schedule'],
     }
 
-    model = SubDiff(
-        img_size=cfg['data']['image_size'],
-        patch_size=cfg['model']['patch_size'],
-        embed_dim=cfg['model']['embed_dim'],
-        depth=cfg['model']['depth'],
-        num_heads=cfg['model']['num_heads'],
-        decoder_dim=cfg['model']['decoder_embed_dim'],
-        decoder_depth=cfg['model']['decoder_depth'],
-        decoder_num_heads=cfg['model']['decoder_num_heads'],
-        num_timesteps=cfg['diffusion']['num_timesteps'],
-        beta_start=cfg['diffusion']['beta_start'],
-        beta_end=cfg['diffusion']['beta_end'],
-        schedule_type=cfg['diffusion']['schedule_type'],
-        total_epochs=cfg['training']['epochs'],
-        curriculum_cfg=curriculum_cfg,
-        predict_noise=cfg.get('diffusion', {}).get('predict_noise', False),
-        mae_masking=cfg.get('model', {}).get('mae_masking', False),
-        mask_ratio=cfg.get('model', {}).get('mask_ratio', 0.25),
-        dual_decoder=cfg.get('model', {}).get('dual_decoder', False),
-        clean_ratio=cfg.get('model', {}).get('clean_ratio', 0.25),
-        pixel_loss_weight=cfg.get('model', {}).get('pixel_loss_weight', 1.0),
-        naive_mae=cfg.get('model', {}).get('naive_mae', False),
-        naive_ddpm=cfg.get('model', {}).get('naive_ddpm', False),
-        qk_norm=cfg.get('model', {}).get('qk_norm', False),
-        dit_minimal_head=cfg.get('model', {}).get('dit_minimal_head', False),
-        use_indicators=cfg.get('model', {}).get('use_indicators', False),
-        use_conv_refine=cfg.get('model', {}).get('use_conv_refine', False),
-        loss_weighting=cfg.get('diffusion', {}).get('loss_weighting', 'simple'),
-        snr_gamma=cfg.get('diffusion', {}).get('snr_gamma', 5.0),
-        pos_embed_type=cfg.get('model', {}).get('pos_embed_type', 'sincos'),
-        flow_matching=cfg.get('diffusion', {}).get('flow_matching', False),
-        rf_t_sampling=cfg.get('diffusion', {}).get('rf_t_sampling', 'logit_normal'),
-        rf_logit_mean=cfg.get('diffusion', {}).get('rf_logit_mean', 0.0),
-        rf_logit_std=cfg.get('diffusion', {}).get('rf_logit_std', 1.0),
-        rf_mae_enabled=cfg.get('diffusion', {}).get('rf_mae_enabled', False),
-        rf_mae_max_mask=cfg.get('diffusion', {}).get('rf_mae_max_mask', 0.5),
-        mae_aux_weight=cfg.get('diffusion', {}).get('mae_aux_weight', 0.1),
-    ).to(device)
+    model = build_subdiff_from_cfg(cfg, curriculum_cfg).to(device)
+
+    # Cold-RF (Run 12): build a SEPARATE frozen mu_model from a different
+    # config + ckpt. Its only role is to provide μ via compute_mu(); we
+    # don't register it as a submodule on the trainable model.
+    mu_model = None
+    if cfg.get('model', {}).get('cold_rf', False):
+        mu_cfg_path = cfg['model']['cold_rf_mu_config']
+        mu_ckpt_path = cfg['model']['cold_rf_mu_ckpt']
+        with open(mu_cfg_path) as f:
+            mu_cfg = yaml.safe_load(f)
+        mu_curriculum_cfg = {
+            't_min_start': mu_cfg['curriculum']['t_min_start'],
+            't_min_end': mu_cfg['curriculum']['t_min_end'],
+            't_max_start': mu_cfg['curriculum']['t_max_start'],
+            't_max_end': mu_cfg['curriculum']['t_max_end'],
+            'clean_ratio_start': mu_cfg['curriculum']['clean_ratio_start'],
+            'clean_ratio_end': mu_cfg['curriculum']['clean_ratio_end'],
+            'warmup_epochs': mu_cfg['curriculum']['warmup_epochs'],
+            'schedule': mu_cfg['curriculum']['schedule'],
+        }
+        mu_model = build_subdiff_from_cfg(mu_cfg, mu_curriculum_cfg).to(device)
+        mu_ckpt = torch.load(mu_ckpt_path, map_location=device, weights_only=False)
+        state = mu_ckpt['model']
+        if getattr(mu_model.encoder, 'pos_embed_type', 'learnable') == 'sincos':
+            state = {k: v for k, v in state.items()
+                     if not k.endswith('encoder.pos_embed')}
+        mu_model.load_state_dict(state, strict=False)
+        mu_model.eval()
+        for p in mu_model.parameters():
+            p.requires_grad = False
+        if is_main:
+            print(f"Loaded frozen mu_model from {mu_ckpt_path} "
+                  f"(ep {mu_ckpt.get('epoch', '?')}, "
+                  f"avg_loss={mu_ckpt.get('avg_loss', 'n/a')})")
 
     if is_main:
         param_count = sum(p.numel() for p in model.parameters()) / 1e6
-        if model.naive_ddpm:
+        if getattr(model, 'cold_rf', False):
+            mode = "cold-RF refiner (v-head only, μ from frozen mu_model)"
+        elif model.naive_ddpm:
             head_type = "minimal head" if model.dit_minimal_head else "4-layer decoder"
             if model.flow_matching:
                 if model.rf_mae_enabled:
@@ -326,6 +367,19 @@ def main():
         for step, (imgs, _) in enumerate(train_loader):
             t_data = time.time() - t_iter_start  # time spent waiting for data
             imgs = imgs.to(device, non_blocking=True)
+
+            # Cold-RF (Run 12): pre-compute μ from frozen mu_model and the
+            # per-step noisy mask, then attach to the trainable refiner so
+            # _forward_cold_rf can read them. This keeps the DDP forward
+            # signature intact (still just forward(imgs, epoch)).
+            if mu_model is not None:
+                B_ = imgs.shape[0]
+                N_ = model_raw.num_patches
+                noisy_mask_ = model_raw.diffusion.generate_noisy_mask(
+                    B_, N_, model_raw.clean_ratio, device)
+                with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
+                    mu_ = mu_model.compute_mu(imgs, noisy_mask_)
+                model_raw.set_cold_context(mu_, noisy_mask_)
 
             with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
                 if distributed:

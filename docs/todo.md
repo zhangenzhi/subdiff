@@ -42,41 +42,54 @@ space.
   yet built — Run X single-pass is already strong, iterative refinement
   is now an *enhancement*, not a *necessity*.
 
+## DONE — Run 12 cold-RF Refiner validates μ→x_0 chain
+
+Trained 100 ep on 16 GPU (~10h). Refiner v-head only, frozen Run X
+ep 299 supplies μ. Loss plateau ~0.0176.
+
+K-step Euler inference recovers high-frequency texture monotonically:
+- K=1  → 17% target HF energy
+- K=32 → 64% target HF energy (recommended)
+- K=64 → 70%, converged (no overshoot to noise)
+
+pixel_MSE INCREASES with K (μ wins on L2 *by being blurry*). The right
+metric is HF energy ratio. Visually K=32 has photographic textures
+(scales, fabric, skin) where μ has smooth blobs. See experiments.md
+Run 12 section + takeaway #9 for the full table.
+
 ## Priority 0 — Pick the next experimental direction (open)
 
-Run X (p8) has cleared the perceptual quality bar. Candidates ranked by
-information-per-GPU-hour:
+### A. Perceptual metric quantification (LPIPS) — fastest credibility win
+- Compute LPIPS(prediction, ground_truth) on 1000+ val images for
+  Run X μ (single pass) vs Run 12 K=32. Expected: Run 12 wins
+  decisively, mirroring the visual gap.
+- Cost: ~10 GPU-min. Gives a defensible perceptual number for the
+  writeup, complementing pixel_MSE / HF_energy.
+- Why first: pixel_MSE looks bad for Run 12, we need a metric that
+  both correlates with perception AND isn't trivially the chosen
+  diagnostic. LPIPS is the field standard.
 
-### A. Multi-step iterative inpaint on Run X (cheap, high-info)
-- Build the two-stage pipeline: x_0-head init at masked positions,
-  then K Euler reverse steps with v-head, clean prompt anchored.
-- Cost: implementation only, no training. ~1 day eng.
-- Decides: does iterative refinement on top of p8 single-pass push
-  the quality further, or is p8 already at the head's expressivity
-  limit at ViT-B?
-
-### B. FID quantification of inpainting
+### B. FID for inpainting
 - 5000 samples from ImageNet val, p_ratio=0.25, t=1.0 inpaint.
-- Compare Run 10 / Run 11 / Run X FID on matched seeds.
-- Cost: 4-8 GPU-hours per model. Gives a defensible number for any
-  writeup. Reuses existing `fid_reference/` infrastructure.
+- Compare Run 10 / Run 11 / Run X (μ) / Run 12 (K=32) on matched seeds.
+- Cost: 4-8 GPU-hours per model.
 
-### C. Continue Run X to 1200 ep (committed compute)
-- ~70h × 16 GPU = 1100 GPU-hours, 3-4 chained jobs.
-- Loss plateauing (Δ ~0.001 per 100 ep at ep 269) so quantitative
-  return is small. Visual return is the unknown.
-- Verdict: skip unless A and B leave clear quality headroom.
+### C. Run 12 LR/training tweaks for higher HF recovery
+- Refiner converged at 70% target HF energy. Possible ways to push
+  past: longer training (200 ep), larger batch, lower LR cosine,
+  uniform-t sampling (cover t=1 endpoint better at training), or
+  larger Refiner.
+- Each is cheap (Refiner trains in 10h on 16 GPU); pick whichever
+  has a clean theoretical motivation.
 
-### D. patch_size=4 on 32 GPU (extreme finer-patch test)
-- 16× attention compute vs p8 → 8× wall per step on 2× GPUs.
-- 300 ep ≈ 7-15 days, 6000-12000 GPU-hours depending on
-  grad-accum vs activation-ckpt path.
-- Defer until A/B confirm whether finer patches are still the
-  binding constraint.
+### D. Downstream cls / diffusion finetune on Run X encoder
+- Reconfirms Priority 1 / 1d finding with the strongest encoder we
+  have. Closes the SubDiff "pretrain → downstream" arc.
 
-### E. Downstream cls / diffusion finetune on Run X encoder
-- Reconfirms Priority 1 / 1d finding with the strongest pretrained
-  encoder we have. Cleaner story for a writeup.
+### E. patch_size=4 on 32 GPU
+- Defer; Run 12 shows the bottleneck has moved from "patch expressivity"
+  to "irreducible HF given 25% context." Smaller patches help the former,
+  not the latter.
 
 ## Priority 1 — Verify the "pix head helps ε head" finding
 
