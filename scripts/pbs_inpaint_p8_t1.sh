@@ -20,3 +20,5 @@ python scripts/inpaint_t1_grid.py \
   --checkpoint logs_dual_rf_p8/checkpoints/checkpoint_latest.pth \
   --prompt_ratio 0.25 --num_samples 4 \
   --output_dir samples_rf_p8_inpaint_t1/
+
+mv samples_rf_p8_inpaint_t1/t1.0_p0.25.png samples_rf_p8_inpaint_t1/t1.0_p0.25_ep269.png

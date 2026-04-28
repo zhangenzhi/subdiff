@@ -29,24 +29,54 @@ Verdict: **MAE auxiliary task accelerates RF convergence by ~45% epochs
 to the same quality.** First clear architectural win at 224×16 pixel
 space.
 
-## Priority 0 — Run 11 dual-head RF for inpainting (in progress)
+## DONE — Run 11 (p16) and Run X (p8) dual-head RF for inpainting
 
-Launched on 4 GPU after 2026-04-27. Config: `pretrain_vit_b16_dual_rf.yaml`.
-Positioned as **image completion / prompt-to-image**, not unconditional
-generation (avoids Run 7 mode collapse by requiring 25% clean prompt at
-inference, matching training distribution).
+- Run 11: 300 ep on 4 GPU done 2026-04-28, final avg_loss 0.259.
+- Run X: 300 ep on 16 GPU in progress (271/300), best 0.149 at ep 269.
+- Inpaint at t=1 + prompt=25% works: model recovers 75% missing pixels
+  from 25% context, no mode collapse (each row preserves identity).
+- Head-to-head at matched wall time (~22h): p8 wins on both loss (-42%)
+  and perceptual sharpness (scales/logos/faces visible vs blurred blobs).
+- See `experiments.md` Run 11 / Run X sections and takeaway #8.
+- Two-stage `inpaint_rf_dual.py` (x_0-head init + Euler refinement) not
+  yet built — Run X single-pass is already strong, iterative refinement
+  is now an *enhancement*, not a *necessity*.
 
-Key checks during training:
-- visible v-loss should track Run 9 / Run 10 trajectory (~0.20 by ep 80).
-- x_0-head loss should descend lower than Run 10's masked residual
-  (Run 10 had Var(ε)=1.0 floor; Run 11's x_0 target has no such floor).
+## Priority 0 — Pick the next experimental direction (open)
 
-Exit criteria:
-- If x_0-head loss < 0.15 by ep 50 and v-head loss ≈ Run 10 → both heads
-  are learning their respective targets cleanly.
-- Then build `scripts/inpaint_rf_dual.py` doing the two-stage pipeline
-  (x_0-head init + v-head Euler refinement) and compare visual sharpness
-  to Run 10's single-pass output at matched mask ratios.
+Run X (p8) has cleared the perceptual quality bar. Candidates ranked by
+information-per-GPU-hour:
+
+### A. Multi-step iterative inpaint on Run X (cheap, high-info)
+- Build the two-stage pipeline: x_0-head init at masked positions,
+  then K Euler reverse steps with v-head, clean prompt anchored.
+- Cost: implementation only, no training. ~1 day eng.
+- Decides: does iterative refinement on top of p8 single-pass push
+  the quality further, or is p8 already at the head's expressivity
+  limit at ViT-B?
+
+### B. FID quantification of inpainting
+- 5000 samples from ImageNet val, p_ratio=0.25, t=1.0 inpaint.
+- Compare Run 10 / Run 11 / Run X FID on matched seeds.
+- Cost: 4-8 GPU-hours per model. Gives a defensible number for any
+  writeup. Reuses existing `fid_reference/` infrastructure.
+
+### C. Continue Run X to 1200 ep (committed compute)
+- ~70h × 16 GPU = 1100 GPU-hours, 3-4 chained jobs.
+- Loss plateauing (Δ ~0.001 per 100 ep at ep 269) so quantitative
+  return is small. Visual return is the unknown.
+- Verdict: skip unless A and B leave clear quality headroom.
+
+### D. patch_size=4 on 32 GPU (extreme finer-patch test)
+- 16× attention compute vs p8 → 8× wall per step on 2× GPUs.
+- 300 ep ≈ 7-15 days, 6000-12000 GPU-hours depending on
+  grad-accum vs activation-ckpt path.
+- Defer until A/B confirm whether finer patches are still the
+  binding constraint.
+
+### E. Downstream cls / diffusion finetune on Run X encoder
+- Reconfirms Priority 1 / 1d finding with the strongest pretrained
+  encoder we have. Cleaner story for a writeup.
 
 ## Priority 1 — Verify the "pix head helps ε head" finding
 

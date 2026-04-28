@@ -173,7 +173,11 @@ All runs: ViT-B/16 backbone, ImageNet-1K, 4× H100, bf16 mixed precision.
 ### Run 11: Dual-head RF (v + x_0) with clean-prompt patches (inpaint)
 - Config: `pretrain_vit_b16_dual_rf.yaml`
 - Log dir: `logs_dual_rf/`
-- **Status**: launched on 4× H100 after the morning of 2026-04-27.
+- **Status**: completed 300 ep on 4× H100 (~22 h wall) on 2026-04-28.
+- **Final**: avg_loss = 0.259 at ep 299 (latest = best).
+- See "Run X" below for the head-to-head against patch_size=8 at matched
+  wall time; p16 lost decisively on both loss (0.259 vs 0.149) and
+  perceptual quality.
 - **Positioned as image completion / prompt-to-image, not unconditional
   generation.** Run 7 (this same architecture with DDPM ε-target) had
   mode collapse at unconditional sampling — at test time the encoder
@@ -301,3 +305,33 @@ Resume reads `best_loss` from the checkpoint to continue tracking correctly.
    prompt required at both train and inference, no OOD gap, no collapse;
    the v-head and x_0-head become the two stages of an iterative
    inpainting pipeline (x_0 init + Euler refinement).
+8. **Patch size 8 decisively beats patch size 16 for dual-RF inpainting**
+   (Run X vs Run 11, matched wall time ~22h). At ep 269 (Run X) vs
+   ep 299 (Run 11), p8 reaches avg_loss 0.149 vs p16's 0.259 (-42%).
+   t=1 + prompt=25% inpaint with same seed/images: p8 produces visible
+   fish scales, readable jacket logo, recognizable faces; p16 produces
+   blurry color blobs with strong 16×16 grid artifacts. Confirms the
+   Run 8 finding (patch size is the bottleneck) on the dual-RF inpaint
+   pathway, not just unconditional generation. 16× attention compute
+   per step is offset by 4× more GPUs (16 vs 4), keeping wall time
+   comparable.
+
+### Run X: patch_size=8 dual-head RF on 16× H100 (current best)
+- Config: `pretrain_vit_b8_dual_rf.yaml`
+- Log dir: `logs_dual_rf_p8/`
+- 4 nodes × 4 GPU = 16 H100; batch=64/GPU global=1024 (matches Run 11).
+- patch_size 16→8: tokens 196→784 (4×), patch_dim 768→192, attention
+  FLOPs 16× per step. Wall ~4.6 min/epoch (vs Run 11's similar number
+  on 4 GPU because attention compute is 16× higher per token-pair).
+- Multi-node launched via `pbs_tmrsh` + `_torchrun_node.sh` (no SSH keys
+  needed; PBS Task Manager handles inter-node rsh).
+- **Status**: 300-ep run in progress, currently at ep 271/300 (best
+  ep 269 avg_loss 0.149).
+- Loss trajectory: ep 4 → 0.196, ep 14 → 0.175, ep 39 → 0.162,
+  ep 99 → 0.154, ep 199 → 0.150, ep 269 → 0.149 (clearly plateauing).
+- Inpaint validation at t=1 + prompt=25% (`samples_rf_p8_inpaint_t1/`):
+  - ep 4/14/39/269 all run with same seed → monotone visual improvement.
+  - At ep 269 the composite (prompt+recon) is sharp enough that
+    fish scales, jacket logo silhouettes, and facial features are
+    recognizable from only 25% pixel context — the pixel-space ViT-B
+    inpainting pipeline at 224 is now functional.
