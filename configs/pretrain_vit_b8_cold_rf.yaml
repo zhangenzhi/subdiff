@@ -61,7 +61,9 @@ curriculum:
   schedule: linear
 
 training:
-  epochs: 100               # task is "polish residual" — should converge fast
+  epochs: 400               # extended from initial 100 (plateau at ep ~80)
+                            # to validate whether longer training pushes HF
+                            # recovery past the 70% target ceiling at K=64
   batch_size: 64            # per GPU; global = 64 × 16 = 1024
   lr: 1.0e-4
   min_lr: 1.0e-6
