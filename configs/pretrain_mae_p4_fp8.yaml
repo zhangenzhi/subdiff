@@ -1,0 +1,47 @@
+# Run 12e Stage 1 — pure MAE μ-generator at p4 with fp8 (TransformerEngine).
+#
+# Goal: train a stronger μ-predictor than Run X dual-RF p8, by:
+#   (1) Going to p4 (4× tokens) for finer spatial control of the prompt
+#       region — Run X p8 has only 196 prompt tokens at clean_ratio=0.25.
+#   (2) Dropping the RF v-head — pure inpainting tasks don't need
+#       noise→x_0 generation, all model capacity goes to E[x_0|prompt].
+#   (3) Using TE fp8 to fit batch=64 at p4 in 80 GB H100 (probe 530095:
+#       55 GB peak, headroom 30 GB for cold_rf Stage 2 mu_model later).
+#
+# Training noise distribution at the 75% noisy positions matches Run X
+# x_0-head's t=1 input distribution (full Gaussian) — the resulting μ
+# generator is plug-compatible as Stage 2 cold-RF input.
+
+data:
+  imagenet_dir: /lustre1/work/c30636/dataset/imagenet
+  image_size: 224
+  num_workers: 8
+  transform_type: diffusion
+
+model:
+  # Encoder (sees only visible 25% — asymmetric MAE design, He et al. 2021)
+  patch_size: 4
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  # Decoder (sees full N, smaller than encoder per MAE paper)
+  decoder_dim: 512
+  decoder_depth: 8
+  decoder_num_heads: 16
+  clean_ratio: 0.25            # 25% visible (= 75% mask, canonical MAE ratio)
+
+training:
+  epochs: 100
+  batch_size: 64               # per GPU; global = 64 × 16 = 1024 (matches Run X)
+  lr: 1.0e-4
+  min_lr: 1.0e-6
+  weight_decay: 0.0
+  warmup_epochs: 0
+  lr_schedule: constant
+  clip_grad: 1.0
+  fp8: true                    # te.fp8_autocast wraps forward+backward
+
+logging:
+  log_dir: ./logs_run12e_mae_p4_fp8
+  save_every: 5
+  print_every: 100
