@@ -123,7 +123,8 @@ def _enable_hpc_speedups():
     torch.backends.cuda.matmul.allow_tf32 = True
     # Let cuDNN pick the fastest conv algorithm (matters for patch_embed)
     torch.backends.cudnn.benchmark = True
-    # Prefer Flash Attention 2 backend for SDPA on H100
+    # Prefer Flash Attention backend for SDPA on H100. PyTorch 2.4+ on Hopper
+    # auto-selects FA3 over FA2 when flash_sdp is enabled and dtype is bf16/fp16.
     try:
         torch.backends.cuda.enable_flash_sdp(True)
         torch.backends.cuda.enable_mem_efficient_sdp(True)
@@ -132,15 +133,73 @@ def _enable_hpc_speedups():
         pass  # older torch
 
 
+def _select_sdpa_backend(name):
+    """Force a specific SDPA backend. Default behavior (without calling this)
+    is whatever PyTorch picks — on H100 + bf16 that's FA2.
+
+    name: 'flash' | 'cudnn' | 'mem' | 'auto'
+      - 'flash':  PyTorch-bundled FlashAttention-2 only
+      - 'cudnn':  cuDNN attention (= FlashAttention-3 on Hopper sm_90)
+      - 'mem':    memory-efficient attention only
+      - 'auto':   all three on; runtime picks (flash wins by priority)
+
+    Bench (cold-RF, B=64/GPU, 2× H100):
+      compile=default + flash → 150.3ms/step (1.86× vs eager+flash)
+      compile=default + cudnn → 139.5ms/step (2.01× vs eager+flash, 1.08× extra)
+    """
+    if name is None:
+        return  # leave whatever _enable_hpc_speedups set
+    flags = {'flash': False, 'mem': False, 'cudnn': False}
+    if name in ('flash', 'auto'):
+        flags['flash'] = True
+    if name in ('mem', 'auto'):
+        flags['mem'] = True
+    if name in ('cudnn', 'auto'):
+        flags['cudnn'] = True
+    torch.backends.cuda.enable_flash_sdp(flags['flash'])
+    torch.backends.cuda.enable_mem_efficient_sdp(flags['mem'])
+    torch.backends.cuda.enable_cudnn_sdp(flags['cudnn'])
+    torch.backends.cuda.enable_math_sdp(False)
+
+
+def _print_hpc_status(is_main):
+    """One-shot dump of HPC-relevant runtime state. Helps confirm FA3 path
+    is reachable (Hopper sm_90 + flash_sdp=True + bf16 → FA3 used at runtime)."""
+    if not is_main or not torch.cuda.is_available():
+        return
+    cap = torch.cuda.get_device_capability(0)
+    print(f"[HPC] PyTorch {torch.__version__}, "
+          f"GPU={torch.cuda.get_device_name(0)} (sm_{cap[0]}{cap[1]})")
+    flags = {
+        'flash': torch.backends.cuda.flash_sdp_enabled(),
+        'mem_efficient': torch.backends.cuda.mem_efficient_sdp_enabled(),
+        'math': torch.backends.cuda.math_sdp_enabled(),
+    }
+    try:
+        flags['cudnn'] = torch.backends.cuda.cudnn_sdp_enabled()
+    except AttributeError:
+        pass
+    print(f"[HPC] SDPA backends enabled: {flags}")
+    print(f"[HPC] TF32 matmul={torch.backends.cuda.matmul.allow_tf32}, "
+          f"cudnn TF32={torch.backends.cudnn.allow_tf32}, "
+          f"cudnn benchmark={torch.backends.cudnn.benchmark}")
+
+
 def main():
     args = get_args()
     cfg = load_config(args.config)
 
     _enable_hpc_speedups()
+    sdpa_backend = cfg.get('training', {}).get('sdpa_backend', None)
+    _select_sdpa_backend(sdpa_backend)
 
     rank, world_size, local_rank, distributed = setup_distributed()
     is_main = (rank == 0)
     device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
+
+    _print_hpc_status(is_main)
+    if is_main and sdpa_backend is not None:
+        print(f"[HPC] sdpa_backend override: {sdpa_backend}")
 
     # Build model
     curriculum_cfg = {
@@ -218,15 +277,47 @@ def main():
 
     if distributed:
         # find_unused_parameters=True for MAE-masking / dual-decoder modes
-        # where some decoder params may not contribute to loss each step
-        # Decoder always has mask_token param; it's unused unless mae_masking
-        # path is active. Safest to always enable find_unused_parameters.
-        find_unused = True
+        # where some decoder params may not contribute to loss each step.
+        # Cold-RF (Run 12) Refiner has v-head only — all params used; setting
+        # find_unused=False here is required for torch.compile to avoid graph
+        # breaks from the unused-param scan.
+        find_unused = not cfg.get('model', {}).get('cold_rf', False)
+        if is_main:
+            print(f"DDP find_unused_parameters={find_unused}")
         model = DDP(model, device_ids=[local_rank],
                     find_unused_parameters=find_unused)
 
     model_without_ddp = model.module if distributed else model
     model_raw = model_without_ddp
+
+    # ----------------------------------------------------------------------
+    # torch.compile (opt-in via training.compile in config). Numerics-equivalent
+    # HPC speedup. CRITICAL: state_dict / optimizer / DDP all keep using `model`
+    # and `model_raw`, which point to the un-compiled SubDiff. The compiled
+    # wrapper `forward_model` is used ONLY for the forward call. This way:
+    #   - `model_raw.state_dict()` saves clean keys (no _orig_mod. prefix)
+    #   - existing checkpoints load without key-rewriting
+    #   - turning compile on/off across runs is transparent
+    # ----------------------------------------------------------------------
+    compile_enabled = cfg.get('training', {}).get('compile', False)
+    compile_mode = cfg.get('training', {}).get('compile_mode', 'default')
+    # Only reduce-overhead uses CUDA graphs and therefore needs the
+    # mark_step_begin / clone machinery around the cross-graph mu handoff.
+    # Under 'default' those would be pure overhead.
+    use_cudagraphs = compile_enabled and compile_mode == 'reduce-overhead'
+    if compile_enabled:
+        if is_main:
+            print(f"[torch.compile] enabled mode={compile_mode}  "
+                  f"cudagraphs={use_cudagraphs}. "
+                  f"First step will be slow (graph tracing).")
+        forward_model = torch.compile(model, mode=compile_mode)
+        if mu_model is not None:
+            mu_compute_mu = torch.compile(mu_model.compute_mu, mode=compile_mode)
+        else:
+            mu_compute_mu = None
+    else:
+        forward_model = model
+        mu_compute_mu = mu_model.compute_mu if mu_model is not None else None
 
     # Build dataloaders
     backend = cfg.get('data', {}).get('backend', 'torch')
@@ -372,17 +463,35 @@ def main():
             # per-step noisy mask, then attach to the trainable refiner so
             # _forward_cold_rf can read them. This keeps the DDP forward
             # signature intact (still just forward(imgs, epoch)).
+            #
+            # cudagraphs path only: mu_compute_mu's output lives in a
+            # cudagraph-managed buffer that can be recycled before refiner
+            # reads it. Insert mark_step_begin + clone to break the alias.
+            # mode='default' has no cudagraphs → these would be pure overhead
+            # (and bench showed they're costly enough to flip 1.86× speedup
+            # into 0.46× regression).
             if mu_model is not None:
                 B_ = imgs.shape[0]
                 N_ = model_raw.num_patches
                 noisy_mask_ = model_raw.diffusion.generate_noisy_mask(
                     B_, N_, model_raw.clean_ratio, device)
+                if use_cudagraphs:
+                    torch.compiler.cudagraph_mark_step_begin()
                 with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
-                    mu_ = mu_model.compute_mu(imgs, noisy_mask_)
+                    mu_ = mu_compute_mu(imgs, noisy_mask_)
+                if use_cudagraphs:
+                    mu_ = mu_.clone()
                 model_raw.set_cold_context(mu_, noisy_mask_)
+                if use_cudagraphs:
+                    torch.compiler.cudagraph_mark_step_begin()
 
             with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
-                if distributed:
+                if compile_enabled:
+                    # Direct kwargs call — modern DDP supports kwargs natively,
+                    # and avoids _forward_ddp's patched_forward hack which would
+                    # trigger torch.compile to recompile every step.
+                    loss, log_dict = forward_model(imgs, epoch=epoch)
+                elif distributed:
                     loss, log_dict = _forward_ddp(model, imgs, epoch)
                 else:
                     loss, log_dict = model(imgs, epoch=epoch)

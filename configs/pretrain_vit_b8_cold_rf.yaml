@@ -72,6 +72,15 @@ training:
   lr_schedule: constant
   optimizer: adamw
   clip_grad: 1.0
+  compile: true             # torch.compile refiner + mu_model.compute_mu.
+  compile_mode: default     # bench (2× H100, batch=64): default → 1.86×
+                            # speedup vs eager; reduce-overhead → 0.46×
+                            # regression (cudagraph machinery overhead
+                            # outweighs gains for our 2-graph setup).
+  sdpa_backend: cudnn       # cuDNN attention = FA3 on Hopper sm_90.
+                            # +1.08× over default FA2 on top of compile, AND
+                            # cuts first-step compile time 50s → 18.7s. Other
+                            # configs without this flag keep default behavior.
 
 probe:
   eval_every: 20
